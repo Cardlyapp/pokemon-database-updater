@@ -10,6 +10,8 @@ This workspace contains tools to fetch Pokémon card data and Pokémon species d
 - `pokemon-db-updater.py`: Card updater — fetches sets and cards from the TCGdex API and upserts to Supabase.
 - `pokedex-updater.py`: Pokedex updater — fetches Pokémon from PokeAPI, matches cards, and upserts Pokémon to Supabase.
 
+> Code partially made by AI. All code comments made by AI.
+
 **Card Updater (`pokemon-db-updater.py`)**
 
 - Purpose: Download set and card data from TCGdex (`https://api.tcgdex.net/v2/en`) and upsert into Supabase tables (`pokemon_sets`, `cards`, `card_prices`).
