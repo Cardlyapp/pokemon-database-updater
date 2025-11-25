@@ -1,0 +1,11 @@
+/*
+!.gitignore
+!README.md
+!pokemon-db-updater.py
+!pokedex-updater.py
+!.github/
+!.github/**
+.vscode/
+.env
+__pycache__/
+venv/
