@@ -326,68 +326,88 @@ def seed_all_data(limit_sets: Optional[int] = None):
     # Fetch all sets
     sets = fetch_all_sets()
     print(f"\nFound {len(sets)} sets")
-    
+
+    # Filter out Pokémon TCG Pocket sets (by name or id)
+    def is_pocket_set(set_summary):
+        name = (set_summary.get('name') or '').lower()
+        set_id = (set_summary.get('id') or '').lower()
+        # Exclude if 'pocket' in name or id
+        return 'pocket' in name or 'pocket' in set_id
+
+    sets = [s for s in sets if not is_pocket_set(s)]
+    print(f"After filtering, {len(sets)} sets remain (Pocket sets excluded)")
+
     if limit_sets:
         sets = sets[:limit_sets]
         print(f"Limiting to {limit_sets} sets for testing")
-    
+
     sets_success = 0
     cards_success = 0
     cards_failed = 0
     prices_success = 0
-    
+
     # Process each set
     for i, set_summary in enumerate(sets, 1):
         set_id = set_summary.get('id')
         print(f"\n[{i}/{len(sets)}] Processing set: {set_id}")
-        
+
         try:
             # Fetch detailed set information
             set_details = fetch_set_details(set_id)
-            
+            # Check fetched set name/serie for 'pocket'
+            name = (set_details.get('name') or '').lower()
+            serie = set_details.get('serie')
+            if isinstance(serie, dict):
+                serie_name = (serie.get('name') or '').lower()
+            else:
+                serie_name = (serie or '').lower()
+            if 'pocket' in name or 'pocket' in serie_name:
+                print(f"Skipping set '{set_id}' (Pocket set detected by name or serie)")
+                continue
+
             # Upsert set
             if upsert_set(set_details):
                 sets_success += 1
-            
+
             # Fetch and process all cards in the set
             cards = set_details.get('cards', [])
             print(f"Found {len(cards)} cards in set {set_id}")
-            
+
             for j, card_summary in enumerate(cards, 1):
                 card_id = card_summary.get('id')
-                
+
                 try:
                     # Fetch detailed card information
                     card_details = fetch_card_details(card_id)
-                    
+
                     # Upsert card
                     if upsert_card(card_details):
                         cards_success += 1
-                        
+
                         # Upsert pricing data if available
                         if 'pricing' in card_details:
                             price_count = upsert_prices(card_id, card_details['pricing'])
                             prices_success += price_count
                     else:
                         cards_failed += 1
-                    
+
                     # Rate limiting - be respectful to the API
                     if j % 10 == 0:
                         print(f"  Progress: {j}/{len(cards)} cards processed")
                         time.sleep(0.5)
-                        
+
                 except Exception as e:
                     print(f"✗ Error processing card {card_id}: {e}")
                     cards_failed += 1
                     continue
-            
+
             # Pause between sets
             time.sleep(1)
-            
+
         except Exception as e:
             print(f"✗ Error processing set {set_id}: {e}")
             continue
-    
+
     # Print summary
     print("\n" + "="*60)
     print("Seeding Summary")
@@ -401,30 +421,45 @@ def seed_all_data(limit_sets: Optional[int] = None):
 
 def seed_single_set(set_id: str):
     """Seed a single set and its cards (useful for testing)."""
+    # Skip if set_id or set name contains 'pocket'
+    if 'pocket' in (set_id or '').lower():
+        print(f"Skipping set '{set_id}' (Pocket set detected)")
+        return
+
     print(f"Seeding single set: {set_id}")
-    
+
     try:
         # Fetch and upsert set
         set_details = fetch_set_details(set_id)
+        # Also skip if set name or serie contains 'pocket'
+        name = (set_details.get('name') or '').lower()
+        serie = set_details.get('serie')
+        if isinstance(serie, dict):
+            serie_name = (serie.get('name') or '').lower()
+        else:
+            serie_name = (serie or '').lower()
+        if 'pocket' in name or 'pocket' in serie_name:
+            print(f"Skipping set '{set_id}' (Pocket set detected by name or serie)")
+            return
         upsert_set(set_details)
-        
+
         # Fetch and upsert cards
         cards = set_details.get('cards', [])
         print(f"Found {len(cards)} cards")
-        
+
         for card_summary in cards:
             card_id = card_summary.get('id')
             card_details = fetch_card_details(card_id)
             upsert_card(card_details)
-            
+
             # Upsert pricing data if available
             if 'pricing' in card_details:
                 upsert_prices(card_id, card_details['pricing'])
-            
+
             time.sleep(0.3)
-            
+
         print(f"✓ Successfully seeded set {set_id}")
-        
+
     except Exception as e:
         print(f"✗ Error seeding set {set_id}: {e}")
 
