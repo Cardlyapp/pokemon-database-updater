@@ -44,17 +44,5 @@ jobs:
       - name: Verify required modules
         run: |
           python - <<'PY'
-import sys
-try:
-    import requests
-except Exception as e:
-    print('ERROR: required module "requests" is not installed or failed to import:', e)
-    sys.exit(2)
-try:
-    import supabase
-except Exception:
-    print('WARNING: "supabase" package not importable (if the script uses it, add to requirements).')
-PY
-
       - name: Run DB updater
         run: python pokemon-db-updater.py
