@@ -9,8 +9,8 @@ jobs:
   update-db:
     runs-on: ubuntu-latest
     env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL_2 }}
-      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY_2 }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       POKEMON_API_KEY: ${{ secrets.POKEMON_API_KEY }}
     steps:
       - name: Checkout
