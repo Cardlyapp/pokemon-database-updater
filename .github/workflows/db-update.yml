@@ -1,4 +1,4 @@
-name: DB Update Schedule
+name: Database Update
 
 on:
   schedule:
@@ -40,5 +40,7 @@ jobs:
           pip --version
           echo "--- pip list ---"
           pip list
-      - name: Run DB updater
+      - name: Run card updater
         run: python pokemon-db-updater.py
+      - name: Run pokedex updater
+        run: python pokedex-updater.py

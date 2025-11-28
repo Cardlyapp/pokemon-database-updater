@@ -316,10 +316,17 @@ def upsert_prices(card_id: str, pricing_data: Dict) -> int:
         
         if not price_records:
             return 0
-        
-        # Upsert all price records
-        supabase.table('card_prices').upsert(price_records).execute()
-        print(f"  ✓ Upserted {len(price_records)} price records for card {card_id}")
+        # Delete existing price records for this card to avoid duplicates
+        # This replaces old pricing rows with the newly-fetched ones.
+        try:
+            supabase.table('card_prices').delete().eq('card_id', card_id).execute()
+        except Exception:
+            # If delete fails, continue to attempt insert and let the outer try/except
+            pass
+
+        # Insert new price records
+        supabase.table('card_prices').insert(price_records).execute()
+        print(f"  ✓ Inserted {len(price_records)} price records for card {card_id}")
         return len(price_records)
     except Exception as e:
         print(f"  ✗ Error upserting prices for card {card_id}: {e}")
