@@ -5,6 +5,7 @@
 !pokedex-updater.py
 !.github/
 !.github/**
+!requirements.txt
 .vscode/
 .env
 __pycache__/
