@@ -20,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x'
+          python-version: '3.11'
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -33,7 +33,29 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt --verbose; fi
+
+      - name: Show installed packages (debug)
+        run: |
+          echo "--- pip version ---"
+          pip --version
+          echo "--- pip list ---"
+          pip list
+
+      - name: Verify required modules
+        run: |
+          python - <<'PY'
+import sys
+try:
+    import requests
+except Exception as e:
+    print('ERROR: required module "requests" is not installed or failed to import:', e)
+    sys.exit(2)
+try:
+    import supabase
+except Exception:
+    print('WARNING: "supabase" package not importable (if the script uses it, add to requirements).')
+PY
 
       - name: Run DB updater
         run: python pokemon-db-updater.py
