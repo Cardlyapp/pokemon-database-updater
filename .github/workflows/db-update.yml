@@ -2,7 +2,6 @@ name: DB Update Schedule
 
 on:
   schedule:
-    # Runs at 00:00 and 12:00 UTC every day
     - cron: '0 0,12 * * *'
   workflow_dispatch:
 
