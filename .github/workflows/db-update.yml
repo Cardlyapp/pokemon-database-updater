@@ -40,9 +40,5 @@ jobs:
           pip --version
           echo "--- pip list ---"
           pip list
-
-      - name: Verify required modules
-        run: |
-          python - <<'PY'
       - name: Run DB updater
         run: python pokemon-db-updater.py
