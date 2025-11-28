@@ -7,8 +7,8 @@ from rapidfuzz import process, fuzz
 
 # ---------------- CONFIG ----------------
 load_dotenv()
-SUPABASE_URL = os.getenv("SUPABASE_URL_2")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY_2")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 POKEAPI_BASE = "https://pokeapi.co/api/v2/pokemon"
 BATCH_SIZE = 50
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
