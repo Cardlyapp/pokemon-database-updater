@@ -4,6 +4,7 @@ from datetime import datetime
 from supabase import create_client, Client
 from typing import Dict, List, Optional
 import time
+import argparse
 
 # Load environment variables from .env file
 try:
@@ -108,6 +109,19 @@ def transform_card_data(card_data: Dict) -> Dict:
         image_small_url = f"{base_image_url}/low.webp"
         # Large image: high quality, webp format (600x825)
         image_large_url = f"{base_image_url}/high.webp"
+    else:
+        # Fallback to images.pokemontcg.io when TCGdex image is missing.
+        # Use set id and card number if available to construct URLs.
+        set_id_val = set_info.get('id') if isinstance(set_info, dict) else None
+        card_num = card_data.get('localId') or card_data.get('number') or None
+        if not card_num:
+            # try extracting trailing part of card id like 'base1-1'
+            cid = card_data.get('id')
+            if isinstance(cid, str) and '-' in cid:
+                card_num = cid.split('-')[-1]
+        if set_id_val and card_num:
+            image_small_url = f"https://images.pokemontcg.io/{set_id_val}/{card_num}.png"
+            image_large_url = f"https://images.pokemontcg.io/{set_id_val}/{card_num}_hires.png"
     
     # Helper used to ensure set image urls include .png if missing
     def _ensure_png_for_set(val: Optional[str]) -> Optional[str]:
@@ -500,13 +514,13 @@ if __name__ == "__main__":
     # Initialize Supabase client
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     print("✓ Successfully connected to Supabase\n")
-    
-    # Example usage:
-    # 1. Seed all data (this will take a while!)
-    seed_all_data()
-    
-    # 2. Or seed a limited number of sets for testing
-    # seed_all_data(limit_sets=2)
-    
-    # 3. Or seed a single set
-    # seed_single_set("base1")
+
+    parser = argparse.ArgumentParser(description="Pokemon DB updater (sets, cards, prices)")
+    parser.add_argument("--set", "-s", dest="set_id", help="Seed a single set by id (test mode)")
+    parser.add_argument("--limit", "-l", dest="limit", type=int, help="Limit number of sets to process")
+    args = parser.parse_args()
+
+    if args.set_id:
+        seed_single_set(args.set_id)
+    else:
+        seed_all_data(limit_sets=args.limit)
