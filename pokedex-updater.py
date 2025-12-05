@@ -3,13 +3,15 @@ import re
 import requests
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from rapidfuzz import process, fuzz
+from time import sleep
 
 # ---------------- CONFIG ----------------
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 POKEAPI_BASE = "https://pokeapi.co/api/v2/pokemon"
+TCGDEX_BASE = "https://api.tcgdex.net/v2/en"
+JPNCARDS_BASE = "https://www.jpn-cards.com/v2"
 BATCH_SIZE = 50
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -31,7 +33,7 @@ def normalize_pokemon_name(name: str) -> str:
     """
     name = name.lower()
 
-    # remove known prefixes like "hisuian", "paldean", "alolan", etc.
+    # remove known prefixes like "hisuian", "paldean", "galarian", "alolan", etc.
     name = re.sub(r"^(hisuian|paldean|galarian|alolan|mega|gigantamax)\s+", "", name)
 
     # remove suffixes like "v", "vmax", "ex", "gx"
@@ -69,23 +71,84 @@ def fetch_pokemon_detail(url):
         "sprite_url": data["sprites"]["other"]["official-artwork"]["front_default"],
     }
 
-# ---------------- FUZZY CARD MATCHING ----------------
-def load_card_names():
-    print("Loading card names from Supabase...")
-    res = supabase.table("cards").select("id", "name").execute()
-    if not res.data:
+# ---------------- TCGDEX API ----------------
+def fetch_cards_from_tcgdex(pokemon_name):
+    """
+    Fetch all cards for a given Pokémon from TCGdex API.
+    Returns a list of card IDs.
+    """
+    try:
+        # TCGdex uses lowercase names with hyphens
+        search_name = pokemon_name.lower().replace(" ", "-")
+        url = f"{TCGDEX_BASE}/cards?name={search_name}"
+        
+        print(f"  Searching TCGdex for: {pokemon_name}")
+        res = requests.get(url)
+        res.raise_for_status()
+        cards = res.json()
+        
+        if not cards:
+            print(f"  ⚠️ No cards found for {pokemon_name}")
+            return []
+        
+        # Extract card IDs - TCGdex returns cards with an 'id' field
+        card_ids = [card.get("id") for card in cards if card.get("id")]
+        print(f"  ✅ Found {len(card_ids)} TCGdex cards for {pokemon_name}")
+        
+        # Be nice to the API
+        sleep(0.1)
+        
+        return card_ids
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            print(f"  ⚠️ No cards found for {pokemon_name} (404)")
+            return []
+        print(f"  ❌ HTTP error fetching cards for {pokemon_name}: {e}")
         return []
-    print(f"✅ Loaded {len(res.data)} cards.")
-    return res.data
+    except Exception as e:
+        print(f"  ❌ Error fetching cards for {pokemon_name}: {e}")
+        return []
 
-def find_card_ids_fuzzy(pokemon_name, cards, threshold=80):
-    card_names = [c["name"] for c in cards]
-    matches = process.extract(pokemon_name, card_names, scorer=fuzz.token_sort_ratio, limit=15)
-    return [
-        cards[i]["id"]
-        for (_, score, i) in matches
-        if score >= threshold
-    ]
+def fetch_cards_from_jpncards(pokemon_name):
+    """
+    Fetch all Japanese cards for a given Pokémon from jpn-cards API v2.
+    Returns a list of card UUIDs.
+    """
+    try:
+        # jpn-cards API v2 endpoint - note it's /card/ not /cards/
+        url = f"{JPNCARDS_BASE}/card/name={pokemon_name.lower()}"
+        
+        print(f"  Searching jpn-cards for: {pokemon_name}")
+        res = requests.get(url)
+        res.raise_for_status()
+        data = res.json()
+        
+        # jpn-cards v2 returns {"data": [...], "count": N, "totalCount": N}
+        cards = data.get("data", [])
+        
+        if not cards:
+            print(f"  ⚠️ No Japanese cards found for {pokemon_name}")
+            return []
+        
+        # Extract UUIDs from the response
+        card_ids = [card.get("uuid") for card in cards if card.get("uuid")]
+        print(f"  ✅ Found {len(card_ids)} Japanese cards for {pokemon_name}")
+        
+        # Be nice to the API
+        sleep(0.1)
+        
+        return card_ids
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            print(f"  ⚠️ No Japanese cards found for {pokemon_name} (404)")
+            return []
+        print(f"  ❌ HTTP error fetching Japanese cards for {pokemon_name}: {e}")
+        return []
+    except Exception as e:
+        print(f"  ❌ Error fetching Japanese cards for {pokemon_name}: {e}")
+        return []
 
 # ---------------- UPSERT INTO SUPABASE ----------------
 def upsert_pokemon_batch(batch):
@@ -97,11 +160,6 @@ def upsert_pokemon_batch(batch):
 
 # ---------------- MAIN ----------------
 def main():
-    cards = load_card_names()
-    if not cards:
-        print("⚠️ No cards found in database. Load your card data first.")
-        return
-
     pokemon_list = fetch_all_pokemon()
 
     # We'll collect data grouped by normalized Pokémon name
@@ -111,7 +169,14 @@ def main():
         try:
             detail = fetch_pokemon_detail(p["url"])
             base_name = normalize_pokemon_name(detail["name"])
-            card_ids = find_card_ids_fuzzy(base_name, cards)
+            
+            # Fetch cards from both TCGdex and jpn-cards APIs
+            tcgdex_cards = fetch_cards_from_tcgdex(base_name)
+            jpn_cards = fetch_cards_from_jpncards(base_name)
+            
+            # Combine all card IDs
+            all_card_ids = tcgdex_cards + jpn_cards
+            
             if base_name not in grouped_pokemon:
                 grouped_pokemon[base_name] = {
                     "id": detail["id"],  # first seen ID
@@ -119,13 +184,15 @@ def main():
                     "types": detail["types"],
                     "abilities": detail["abilities"],
                     "sprite_url": detail["sprite_url"],
-                    "card_ids": set(card_ids),
+                    "card_ids": set(all_card_ids),
                 }
             else:
                 # Merge cards from variants
-                grouped_pokemon[base_name]["card_ids"].update(card_ids)
+                grouped_pokemon[base_name]["card_ids"].update(all_card_ids)
 
-            print(f"Processed {detail['name']} → {base_name} ({len(card_ids)} cards)")
+            total_cards = len(tcgdex_cards) + len(jpn_cards)
+            print(f"Processed {detail['name']} → {base_name} ({total_cards} total cards: {len(tcgdex_cards)} EN + {len(jpn_cards)} JP)")
+
 
         except Exception as e:
             print(f"❌ Error on {p['name']}: {e}")
