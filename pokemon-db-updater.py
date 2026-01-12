@@ -725,6 +725,53 @@ def seed_both_versions(limit_sets: Optional[int] = None):
     print("COMPLETED BOTH VERSIONS")
     print("="*60)
 
+def update_card_prices(card_id: str, version: str = "international", show_prices: bool = False) -> int:
+    """Fetch and update prices for a single card."""
+    try:
+        card_details = fetch_card_details(card_id, version)
+        if not card_details:
+            return 0
+
+        pricing = card_details.get("pricing")
+        if not pricing:
+            return 0
+
+        if show_prices:
+            print(f"\n📊 Pricing data for {card_id}:")
+            print(pricing)
+
+        return upsert_prices(card_id, pricing)
+
+    except Exception as e:
+        print(f"✗ Failed to update prices for {card_id}: {e}")
+        return 0
+
+def seed_prices_only(version: str = "international", show_prices: bool = False):
+    """Update prices for all cards already in the database."""
+    print("=" * 60)
+    print(f"Updating prices only ({version})")
+    print("=" * 60)
+
+    cards = supabase.table("cards").select("id").eq("version", version).execute().data
+
+    print(f"Found {len(cards)} cards to update prices for")
+
+    total_prices = 0
+
+    for i, card in enumerate(cards, 1):
+        card_id = card["id"]
+        print(f"[{i}/{len(cards)}] Updating prices for {card_id}")
+
+        count = update_card_prices(card_id, version, show_prices)
+        total_prices += count
+
+        if i % 10 == 0:
+            time.sleep(0.5)
+
+    print("\n✓ Price update complete")
+    print(f"Total price records inserted: {total_prices}")
+
+
 
 if __name__ == "__main__":
     # Check for environment variables
@@ -768,11 +815,33 @@ if __name__ == "__main__":
     parser.add_argument("--limit", "-l", dest="limit", type=int, help="Limit number of sets to process")
     parser.add_argument("--version", "-v", dest="version", choices=["international", "japan", "both"], 
                         default="international", help="Which version to seed (default: international)")
+    parser.add_argument(
+    "--prices-only",
+    action="store_true",
+    help="Update prices only (no sets or cards)"
+    )
+
+    parser.add_argument(
+        "--show-prices",
+        action="store_true",
+        help="Print pricing data when fetched"
+    )
+
     args = parser.parse_args()
 
-    if args.set_id:
+    if args.prices_only:
+        if args.version == "both":
+            seed_prices_only("international", show_prices=args.show_prices)
+            time.sleep(2)
+            seed_prices_only("japan", show_prices=args.show_prices)
+        else:
+            seed_prices_only(args.version, show_prices=args.show_prices)
+
+    elif args.set_id:
         seed_single_set(args.set_id, version=args.version if args.version != "both" else "international")
+
     elif args.version == "both":
         seed_both_versions(limit_sets=args.limit)
+
     else:
         seed_all_data(limit_sets=args.limit, version=args.version)
