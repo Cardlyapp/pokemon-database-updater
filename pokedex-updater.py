@@ -3,7 +3,8 @@ import re
 import requests
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from time import sleep
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -13,6 +14,7 @@ POKEAPI_BASE = "https://pokeapi.co/api/v2/pokemon"
 TCGDEX_BASE = "https://api.tcgdex.net/v2/en"
 JPNCARDS_BASE = "https://www.jpn-cards.com/v2"
 BATCH_SIZE = 50
+MAX_WORKERS = 30  # Concurrent requests
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------- HELPERS ----------------
@@ -32,14 +34,9 @@ def normalize_pokemon_name(name: str) -> str:
              'Mega Charizard X' -> 'Charizard'
     """
     name = name.lower()
-
-    # remove known prefixes like "hisuian", "paldean", "galarian", "alolan", etc.
     name = re.sub(r"^(hisuian|paldean|galarian|alolan|mega|gigantamax)\s+", "", name)
-
-    # remove suffixes like "v", "vmax", "ex", "gx"
     for pattern in VARIANT_PATTERNS:
         name = re.sub(pattern, "", name)
-
     return name.strip().capitalize()
 
 # ---------------- FETCH DATA ----------------
@@ -73,144 +70,141 @@ def fetch_pokemon_detail(url):
 
 # ---------------- TCGDEX API ----------------
 def fetch_cards_from_tcgdex(pokemon_name):
-    """
-    Fetch all cards for a given Pokémon from TCGdex API.
-    Returns a list of card IDs.
-    """
+    """Fetch all cards for a given Pokémon from TCGdex API."""
     try:
-        # TCGdex uses lowercase names with hyphens
         search_name = pokemon_name.lower().replace(" ", "-")
         url = f"{TCGDEX_BASE}/cards?name={search_name}"
-        
-        print(f"  Searching TCGdex for: {pokemon_name}")
-        res = requests.get(url)
+        res = requests.get(url, timeout=10)
         res.raise_for_status()
         cards = res.json()
         
         if not cards:
-            print(f"  ⚠️ No cards found for {pokemon_name}")
             return []
         
-        # Extract card IDs - TCGdex returns cards with an 'id' field
         card_ids = [card.get("id") for card in cards if card.get("id")]
-        print(f"  ✅ Found {len(card_ids)} TCGdex cards for {pokemon_name}")
-        
-        # Be nice to the API
-        sleep(0.1)
-        
         return card_ids
         
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            print(f"  ⚠️ No cards found for {pokemon_name} (404)")
             return []
-        print(f"  ❌ HTTP error fetching cards for {pokemon_name}: {e}")
         return []
-    except Exception as e:
-        print(f"  ❌ Error fetching cards for {pokemon_name}: {e}")
+    except Exception:
         return []
 
 def fetch_cards_from_jpncards(pokemon_name):
-    """
-    Fetch all Japanese cards for a given Pokémon from jpn-cards API v2.
-    Returns a list of card UUIDs.
-    """
+    """Fetch all Japanese cards for a given Pokémon from jpn-cards API v2."""
     try:
-        # jpn-cards API v2 endpoint - note it's /card/ not /cards/
         url = f"{JPNCARDS_BASE}/card/name={pokemon_name.lower()}"
-        
-        print(f"  Searching jpn-cards for: {pokemon_name}")
-        res = requests.get(url)
+        res = requests.get(url, timeout=10)
         res.raise_for_status()
         data = res.json()
-        
-        # jpn-cards v2 returns {"data": [...], "count": N, "totalCount": N}
         cards = data.get("data", [])
         
         if not cards:
-            print(f"  ⚠️ No Japanese cards found for {pokemon_name}")
             return []
         
-        # Extract UUIDs from the response
         card_ids = [card.get("uuid") for card in cards if card.get("uuid")]
-        print(f"  ✅ Found {len(card_ids)} Japanese cards for {pokemon_name}")
-        
-        # Be nice to the API
-        sleep(0.1)
-        
         return card_ids
         
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            print(f"  ⚠️ No Japanese cards found for {pokemon_name} (404)")
             return []
-        print(f"  ❌ HTTP error fetching Japanese cards for {pokemon_name}: {e}")
         return []
+    except Exception:
+        return []
+
+# ---------------- PROCESS POKEMON ----------------
+def process_pokemon(p):
+    """Process a single Pokémon and fetch all related data."""
+    try:
+        detail = fetch_pokemon_detail(p["url"])
+        base_name = normalize_pokemon_name(detail["name"])
+        
+        # Fetch cards from both APIs concurrently
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            tcgdex_future = executor.submit(fetch_cards_from_tcgdex, base_name)
+            jpn_future = executor.submit(fetch_cards_from_jpncards, base_name)
+            
+            tcgdex_cards = tcgdex_future.result()
+            jpn_cards = jpn_future.result()
+        
+        all_card_ids = tcgdex_cards + jpn_cards
+        
+        return {
+            "base_name": base_name,
+            "detail": detail,
+            "card_ids": all_card_ids,
+            "success": True
+        }
     except Exception as e:
-        print(f"  ❌ Error fetching Japanese cards for {pokemon_name}: {e}")
-        return []
+        return {
+            "base_name": p.get("name", "Unknown"),
+            "error": str(e),
+            "success": False
+        }
 
 # ---------------- UPSERT INTO SUPABASE ----------------
 def upsert_pokemon_batch(batch):
     try:
         supabase.table("pokedex").upsert(batch).execute()
-        print(f"✅ Upserted {len(batch)} Pokémon")
     except Exception as e:
-        print(f"❌ Error during batch upsert: {e}")
+        print(f"\n❌ Error during batch upsert: {e}")
 
 # ---------------- MAIN ----------------
 def main():
     pokemon_list = fetch_all_pokemon()
-
-    # We'll collect data grouped by normalized Pokémon name
     grouped_pokemon = {}
 
-    for p in pokemon_list:
-        try:
-            detail = fetch_pokemon_detail(p["url"])
-            base_name = normalize_pokemon_name(detail["name"])
-            
-            # Fetch cards from both TCGdex and jpn-cards APIs
-            tcgdex_cards = fetch_cards_from_tcgdex(base_name)
-            jpn_cards = fetch_cards_from_jpncards(base_name)
-            
-            # Combine all card IDs
-            all_card_ids = tcgdex_cards + jpn_cards
-            
-            if base_name not in grouped_pokemon:
-                grouped_pokemon[base_name] = {
-                    "id": detail["id"],  # first seen ID
-                    "name": base_name,
-                    "types": detail["types"],
-                    "abilities": detail["abilities"],
-                    "sprite_url": detail["sprite_url"],
-                    "card_ids": set(all_card_ids),
-                }
-            else:
-                # Merge cards from variants
-                grouped_pokemon[base_name]["card_ids"].update(all_card_ids)
+    print(f"\n🔄 Processing {len(pokemon_list)} Pokémon...")
+    
+    # Process all Pokémon concurrently with progress bar
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_pokemon, p): p for p in pokemon_list}
+        
+        with tqdm(total=len(pokemon_list), desc="Processing Pokémon", unit="pokemon") as pbar:
+            for future in as_completed(futures):
+                result = future.result()
+                
+                if result["success"]:
+                    base_name = result["base_name"]
+                    detail = result["detail"]
+                    card_ids = result["card_ids"]
+                    
+                    if base_name not in grouped_pokemon:
+                        grouped_pokemon[base_name] = {
+                            "id": detail["id"],
+                            "name": base_name,
+                            "types": detail["types"],
+                            "abilities": detail["abilities"],
+                            "sprite_url": detail["sprite_url"],
+                            "card_ids": set(card_ids),
+                        }
+                    else:
+                        grouped_pokemon[base_name]["card_ids"].update(card_ids)
+                else:
+                    tqdm.write(f"❌ Error on {result['base_name']}: {result.get('error', 'Unknown')}")
+                
+                pbar.update(1)
 
-            total_cards = len(tcgdex_cards) + len(jpn_cards)
-            print(f"Processed {detail['name']} → {base_name} ({total_cards} total cards: {len(tcgdex_cards)} EN + {len(jpn_cards)} JP)")
-
-
-        except Exception as e:
-            print(f"❌ Error on {p['name']}: {e}")
-
-    # Prepare batches for upsert
+    # Prepare and upsert batches
+    print(f"\n📤 Uploading {len(grouped_pokemon)} Pokémon to Supabase...")
     buffer = []
-    for i, (name, data) in enumerate(grouped_pokemon.items(), start=1):
-        data["card_ids"] = list(data["card_ids"])
-        buffer.append(data)
+    
+    with tqdm(total=len(grouped_pokemon), desc="Uploading batches", unit="pokemon") as pbar:
+        for name, data in grouped_pokemon.items():
+            data["card_ids"] = list(data["card_ids"])
+            buffer.append(data)
 
-        if len(buffer) >= BATCH_SIZE:
+            if len(buffer) >= BATCH_SIZE:
+                upsert_pokemon_batch(buffer)
+                pbar.update(len(buffer))
+                buffer.clear()
+
+        if buffer:
             upsert_pokemon_batch(buffer)
-            buffer.clear()
+            pbar.update(len(buffer))
 
-    if buffer:
-        upsert_pokemon_batch(buffer)
-
-    print(f"🎉 Grouped {len(grouped_pokemon)} base Pokémon imported successfully!")
+    print(f"\n🎉 Successfully imported {len(grouped_pokemon)} base Pokémon!")
 
 if __name__ == "__main__":
     main()
