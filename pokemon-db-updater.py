@@ -5,6 +5,7 @@ from supabase import create_client, Client
 from typing import Dict, List, Optional
 import time
 import argparse
+from tqdm import tqdm
 
 # Load environment variables from .env file
 try:
@@ -471,10 +472,10 @@ def upsert_set(set_data: Dict, version: str = "international") -> bool:
         source = detect_data_source(set_data)
         transformed_data = transform_set_data(set_data, version, source)
         supabase.table('pokemon_sets').upsert(transformed_data).execute()
-        print(f"✓ Upserted {version} set: {transformed_data['name']} (source: {source})")
+        tqdm.write(f"✓ Upserted {version} set: {transformed_data['name']} (source: {source})")
         return True
     except Exception as e:
-        print(f"✗ Error upserting {version} set {set_data.get('id')}: {e}")
+        tqdm.write(f"✗ Error upserting {version} set {set_data.get('id')}: {e}")
         return False
 
 
@@ -484,10 +485,10 @@ def upsert_card(card_data: Dict, version: str = "international") -> bool:
         source = detect_data_source(card_data)
         transformed_data = transform_card_data(card_data, version, source)
         supabase.table('cards').upsert(transformed_data).execute()
-        print(f"✓ Upserted {version} card: {transformed_data['name']} ({transformed_data['id']}) (source: {source})")
+        tqdm.write(f"✓ Upserted {version} card: {transformed_data['name']} ({transformed_data['id']}) (source: {source})")
         return True
     except Exception as e:
-        print(f"✗ Error upserting {version} card {card_data.get('id')}: {e}")
+        tqdm.write(f"✗ Error upserting {version} card {card_data.get('id')}: {e}")
         return False
 
 
@@ -511,10 +512,10 @@ def upsert_prices(card_id: str, pricing_data: Dict) -> int:
 
         # Insert new price records
         supabase.table('card_prices').insert(price_records).execute()
-        print(f"  ✓ Inserted {len(price_records)} price records for card {card_id}")
+        tqdm.write(f"  ✓ Inserted {len(price_records)} price records for card {card_id}")
         return len(price_records)
     except Exception as e:
-        print(f"  ✗ Error upserting prices for card {card_id}: {e}")
+        tqdm.write(f"  ✗ Error upserting prices for card {card_id}: {e}")
         return 0
 
 
@@ -565,10 +566,10 @@ def seed_all_data(limit_sets: Optional[int] = None, version: str = "internationa
     cards_failed = 0
     prices_success = 0
 
-    # Process each set
-    for i, set_summary in enumerate(sets, 1):
+    # Process each set (show progress bar)
+    for i, set_summary in enumerate(tqdm(sets, desc=f"Sets ({version})", unit="set"), 1):
         set_id = set_summary.get('id')
-        print(f"\n[{i}/{len(sets)}] Processing {version} set: {set_id}")
+        tqdm.write(f"\n[{i}/{len(sets)}] Processing {version} set: {set_id}")
 
         try:
             # Fetch detailed set information
@@ -598,9 +599,8 @@ def seed_all_data(limit_sets: Optional[int] = None, version: str = "internationa
             else:
                 cards = set_details.get('cards', [])
 
-            print(f"Found {len(cards)} cards in set {set_id}")
-
-            for j, card_summary in enumerate(cards, 1):
+            tqdm.write(f"Found {len(cards)} cards in set {set_id}")
+            for j, card_summary in enumerate(tqdm(cards, desc=f"Cards in {set_id}", unit="card", leave=False), 1):
                 card_id = card_summary.get('id')
 
                 try:
@@ -624,7 +624,7 @@ def seed_all_data(limit_sets: Optional[int] = None, version: str = "internationa
 
                     # Rate limiting - be respectful to the API
                     if j % 10 == 0:
-                        print(f"  Progress: {j}/{len(cards)} cards processed")
+                        tqdm.write(f"  Progress: {j}/{len(cards)} cards processed")
                         time.sleep(0.5)
 
                 except Exception as e:
@@ -654,12 +654,12 @@ def seed_single_set(set_id: str, version: str = "international"):
     """Seed a single set and its cards (useful for testing)."""
     # Skip if set_id or set name contains 'pocket'
     if 'pocket' in (set_id or '').lower():
-        print(f"Skipping set '{set_id}' (Pocket set detected)")
+        tqdm.write(f"Skipping set '{set_id}' (Pocket set detected)")
         return
 
-    print(f"Seeding single {version} set: {set_id}")
+    tqdm.write(f"Seeding single {version} set: {set_id}")
     if version == "japan":
-        print("Trying jpn-cards API first, will fallback to TCGdex if needed")
+        tqdm.write("Trying jpn-cards API first, will fallback to TCGdex if needed")
 
     try:
         # Fetch and upsert set
@@ -682,13 +682,13 @@ def seed_single_set(set_id: str, version: str = "international"):
 
         # Fetch and upsert cards
         cards = set_details.get('cards', [])
-        print(f"Found {len(cards)} cards")
+        tqdm.write(f"Found {len(cards)} cards")
 
-        for card_summary in cards:
+        for card_summary in tqdm(cards, desc=f"Single set {set_id} cards", unit="card"):
             card_id = card_summary.get('id')
             card_details = fetch_card_details(card_id, version)
             if card_details is None:
-                print(f"✗ Could not fetch card details for {card_id}")
+                tqdm.write(f"✗ Could not fetch card details for {card_id}")
                 continue
             upsert_card(card_details, version)
 
@@ -754,13 +754,13 @@ def seed_prices_only(version: str = "international", show_prices: bool = False):
 
     cards = supabase.table("cards").select("id").eq("version", version).execute().data
 
-    print(f"Found {len(cards)} cards to update prices for")
+    tqdm.write(f"Found {len(cards)} cards to update prices for")
 
     total_prices = 0
 
-    for i, card in enumerate(cards, 1):
+    for i, card in enumerate(tqdm(cards, desc=f"Price updates ({version})", unit="card"), 1):
         card_id = card["id"]
-        print(f"[{i}/{len(cards)}] Updating prices for {card_id}")
+        tqdm.write(f"[{i}/{len(cards)}] Updating prices for {card_id}")
 
         count = update_card_prices(card_id, version, show_prices)
         total_prices += count
@@ -768,8 +768,8 @@ def seed_prices_only(version: str = "international", show_prices: bool = False):
         if i % 10 == 0:
             time.sleep(0.5)
 
-    print("\n✓ Price update complete")
-    print(f"Total price records inserted: {total_prices}")
+    tqdm.write("\n✓ Price update complete")
+    tqdm.write(f"Total price records inserted: {total_prices}")
 
 
 
