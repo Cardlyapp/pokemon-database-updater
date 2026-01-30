@@ -2,4 +2,4 @@ requests>=2.28.0
 supabase>=1.0.0
 python-dotenv>=1.0.0
 rapidfuzz>=1.9.1
-tqdm>=10.9.2
+tqdm>=4.67.1
