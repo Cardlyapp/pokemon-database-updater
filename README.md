@@ -1,7 +1,5 @@
 # Pokemon Card & Pokedex Updater
 
-> This README was made by AI.
-
 This workspace contains tools to fetch Pokémon card data and Pokémon species data, transform them, and upsert into Supabase tables. Supports both international and Japanese card data.
 
 ## Scripts
@@ -9,7 +7,6 @@ This workspace contains tools to fetch Pokémon card data and Pokémon species d
 - **`pokemon-db-updater.py`**: Card updater — fetches sets and cards from TCGdex and jpn-cards APIs and upserts to Supabase.
 - **`pokedex-updater.py`**: Pokedex updater — fetches Pokémon from PokeAPI, matches cards from both APIs, and upserts Pokémon to Supabase.
 
-> Code partially made by AI. All code comments made by AI.
 
 ---
 
