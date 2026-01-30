@@ -41,6 +41,6 @@ jobs:
           echo "--- pip list ---"
           pip list
       - name: Run card updater
-        run: python pokemon-db-updater.py
+        run: python pokemon-db-updater.py --version both
       - name: Run pokedex updater
         run: python pokedex-updater.py
