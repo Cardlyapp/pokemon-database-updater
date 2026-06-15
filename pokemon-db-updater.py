@@ -213,6 +213,7 @@ def transform_card_data_jpn_cards(card_data: Dict) -> Dict:
         'description': None,
         'tcgplayer_url': card_data.get('cardUrl'),
         'variants': None,
+        'variants_detailed': variants_detailed,
         'version': 'japan',
         'updated_at': datetime.now().isoformat()
     }
@@ -309,6 +310,30 @@ def transform_card_data(card_data: Dict, version: str = "international", source:
             return base + query
         return base + '.png' + query
 
+    variants_detailed = None
+    if isinstance(card_data.get('variants_detailed'), list):
+        variants_detailed = {}
+        for item in card_data['variants_detailed']:
+            if not isinstance(item, dict):
+                continue
+            variant_type = item.get('type')
+            variant_size = item.get('size')
+            if not variant_type or not variant_size:
+                continue
+
+            existing = variants_detailed.get(variant_type)
+            if existing is None:
+                variants_detailed[variant_type] = variant_size
+            elif existing != variant_size:
+                if isinstance(existing, list):
+                    if variant_size not in existing:
+                        existing.append(variant_size)
+                else:
+                    variants_detailed[variant_type] = [existing, variant_size]
+
+        if not variants_detailed:
+            variants_detailed = None
+
     return {
         'id': card_data.get('id'),
         'name': card_data.get('name'),
@@ -335,6 +360,7 @@ def transform_card_data(card_data: Dict, version: str = "international", source:
         'description': card_data.get('effect') or card_data.get('description'),
         'tcgplayer_url': tcgplayer_url,
         'variants': card_data.get('variants'),
+        'variants_detailed': variants_detailed,
         'version': version,
         'updated_at': datetime.now().isoformat()
     }
