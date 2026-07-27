@@ -44,3 +44,5 @@ jobs:
         run: python pokemon-db-updater.py
       - name: Run pokedex updater
         run: python pokedex-updater.py
+      - name: Run Products updater
+        run: python products-updater.py
