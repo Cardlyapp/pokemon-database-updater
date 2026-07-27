@@ -45,4 +45,4 @@ jobs:
       - name: Run pokedex updater
         run: python pokedex-updater.py
       - name: Run Products updater
-        run: python products-updater.py
+        run: python product-updater.py
