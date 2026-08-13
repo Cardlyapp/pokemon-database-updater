@@ -1,10 +1,10 @@
 # Pokemon Card & Pokedex Updater
 
-This workspace contains tools to fetch Pokémon card data and Pokémon species data, transform them, and upsert into Supabase tables. Supports both international and Japanese card data.
+This workspace contains tools to fetch Pokémon card data and Pokémon species data, transform them, and upsert into Supabase and/or Neon Postgres tables. Supports both international and Japanese card data.
 
 ## Scripts
 
-- **`pokemon-db-updater.py`**: Card updater — fetches sets and cards from TCGdex and jpn-cards APIs and upserts to Supabase.
+- **`pokemon-db-updater.py`**: Card updater — fetches sets and cards from TCGdex and jpn-cards APIs and upserts to Supabase, Neon, or both.
 - **`pokedex-updater.py`**: Pokedex updater — fetches Pokémon from PokeAPI, matches cards from both APIs, and upserts Pokémon to Supabase.
 
 
@@ -13,7 +13,7 @@ This workspace contains tools to fetch Pokémon card data and Pokémon species d
 ## Card Updater (`pokemon-db-updater.py`)
 
 ### Purpose
-Download set and card data from multiple sources and upsert into Supabase tables (`pokemon_sets`, `cards`, `card_prices`).
+Download set and card data from multiple sources and upsert into database tables (`pokemon_sets`, `cards`, `card_prices`). The card updater supports Supabase, Neon, or both.
 
 ### Data Sources
 - **International cards**: TCGdex API (`https://api.tcgdex.net/v2/en`)
@@ -23,27 +23,33 @@ Download set and card data from multiple sources and upsert into Supabase tables
 Required (use `.env` file with python-dotenv):
 - `SUPABASE_URL` — your Supabase project URL
 - `SUPABASE_KEY` — your Supabase anon/service key
+- `DATABASE_URL` — your Neon Postgres connection string, required for Neon uploads
 
 ### Dependencies
 ```bash
-pip install requests supabase python-dotenv
+pip install -r requirements.txt
 ```
 
 ### Usage
 
 **Seed all international cards:**
 ```bash
-python pokemon-db-updater.py
+python pokemon-db-updater.py --db-target neon
 ```
 
 **Seed Japanese cards:**
 ```bash
-python pokemon-db-updater.py --version japan
+python pokemon-db-updater.py --db-target neon --version japan
 ```
 
 **Seed both versions:**
 ```bash
-python pokemon-db-updater.py --version both
+python pokemon-db-updater.py --db-target neon --version both
+```
+
+**Upload to both Supabase and Neon:**
+```bash
+python pokemon-db-updater.py --db-target both --version both
 ```
 
 **Seed a single set (testing):**
@@ -155,6 +161,28 @@ python pokedex-updater.py
 - Image URLs use WebP format for better performance where available
 - All timestamps use ISO 8601 format
 - Upsert operations prevent duplicates using primary keys
+
+## Neon Setup
+
+1. Open your Neon project dashboard.
+2. Click **Connect**, choose your branch, role, and database, then copy the connection string.
+3. Add it to `.env`:
+   ```bash
+   DATABASE_URL="postgresql://USER:PASSWORD@HOST/dbname?sslmode=require&channel_binding=require"
+   ```
+4. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. Create the tables by opening `schema/neon_cards.sql`, pasting it into Neon's SQL Editor, and running it.
+6. Test with one small set:
+   ```bash
+   python pokemon-db-updater.py --db-target neon --set base1
+   ```
+
+Neon is plain Postgres, so there is no Supabase-style RLS to configure for this script. Keep `DATABASE_URL` server-side only; do not expose it in frontend code.
+
+For GitHub Actions, add the same value as a repository secret named `DATABASE_URL`. If both Supabase and Neon credentials are present, `pokemon-db-updater.py` uploads cards to both by default.
 
 ## Contributing
 

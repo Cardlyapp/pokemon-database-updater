@@ -1,11 +1,24 @@
 import os
 import requests
 from datetime import datetime
-from supabase import create_client, Client
+from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import argparse
 from tqdm import tqdm
+
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client = None
+    Client = object
+
+try:
+    import psycopg
+    from psycopg.types.json import Json
+except ImportError:
+    psycopg = None
+    Json = None
 
 # Load environment variables from .env file
 try:
@@ -18,12 +31,203 @@ except ImportError:
 # Configuration
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
 TCGDEX_BASE_URL_EN = "https://api.tcgdex.net/v2/en"
 TCGDEX_BASE_URL_JP = "https://api.tcgdex.net/v2/ja"
 JPN_CARDS_BASE_URL = "https://www.jpn-cards.com/v2"
 
-# Initialize Supabase client (will be set later after validation)
-supabase: Client = None
+database = None
+
+SET_COLUMNS = [
+    "id", "name", "series", "total", "release_date", "images", "legalities",
+    "version", "updated_at",
+]
+
+CARD_COLUMNS = [
+    "id", "name", "supertype", "subtypes", "hp", "types", "rarity", "set_id",
+    "set_name", "set_series", "set_symbol_url", "set_logo_url", "number",
+    "artist", "image_small_url", "image_large_url", "legality_standard",
+    "legality_expanded", "legality_unlimited", "regulation_mark", "stage",
+    "suffix", "description", "tcgplayer_url", "variants", "variants_detailed",
+    "version", "updated_at",
+]
+
+PRICE_COLUMNS = [
+    "card_id", "market_source", "condition", "currency", "low", "mid", "high",
+    "average", "market", "trend", "price_type", "last_updated", "updated_at",
+]
+
+JSONB_COLUMNS = {
+    "images", "legalities", "subtypes", "types", "variants", "variants_detailed",
+}
+
+
+class SupabaseTarget:
+    def __init__(self, url: str, key: str):
+        if create_client is None:
+            raise RuntimeError("supabase is not installed. Run: pip install -r requirements.txt")
+        self.client: Client = create_client(url, key)
+
+    @property
+    def name(self) -> str:
+        return "Supabase"
+
+    def upsert_set(self, row: Dict) -> None:
+        self.client.table("pokemon_sets").upsert(row).execute()
+
+    def upsert_card(self, row: Dict) -> None:
+        self.client.table("cards").upsert(row).execute()
+
+    def replace_prices(self, card_id: str, rows: List[Dict]) -> None:
+        self.client.table("card_prices").delete().eq("card_id", card_id).execute()
+        if rows:
+            self.client.table("card_prices").insert(rows).execute()
+
+    def fetch_card_ids(self, version: str) -> List[str]:
+        rows = self.client.table("cards").select("id").eq("version", version).execute().data
+        return [row["id"] for row in rows]
+
+
+class NeonTarget:
+    def __init__(self, database_url: str):
+        if psycopg is None:
+            raise RuntimeError("psycopg is not installed. Run: pip install -r requirements.txt")
+        self.database_url = database_url
+        self.conn = None
+
+    @property
+    def name(self) -> str:
+        return "Neon"
+
+    def _adapt(self, column: str, value):
+        if column in JSONB_COLUMNS and value is not None:
+            return Json(value)
+        return value
+
+    def _connection(self):
+        if self.conn is None or self.conn.closed:
+            self.conn = psycopg.connect(self.database_url)
+        return self.conn
+
+    def _upsert(self, table: str, row: Dict, columns: List[str], conflict_columns: List[str]) -> None:
+        placeholders = ", ".join(["%s"] * len(columns))
+        column_sql = ", ".join(columns)
+        conflict_sql = ", ".join(conflict_columns)
+        update_sql = ", ".join(
+            [f"{column} = EXCLUDED.{column}" for column in columns if column not in conflict_columns]
+        )
+        values = [self._adapt(column, row.get(column)) for column in columns]
+        query = f"""
+            INSERT INTO {table} ({column_sql})
+            VALUES ({placeholders})
+            ON CONFLICT ({conflict_sql}) DO UPDATE SET
+            {update_sql};
+        """
+
+        conn = self._connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, values)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def upsert_set(self, row: Dict) -> None:
+        self._upsert("pokemon_sets", row, SET_COLUMNS, ["id"])
+
+    def upsert_card(self, row: Dict) -> None:
+        self._upsert("cards", row, CARD_COLUMNS, ["id"])
+
+    def replace_prices(self, card_id: str, rows: List[Dict]) -> None:
+        conn = self._connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM card_prices WHERE card_id = %s;", (card_id,))
+                if rows:
+                    placeholders = ", ".join(["%s"] * len(PRICE_COLUMNS))
+                    query = f"INSERT INTO card_prices ({', '.join(PRICE_COLUMNS)}) VALUES ({placeholders});"
+                    cur.executemany(
+                        query,
+                        [[self._adapt(column, row.get(column)) for column in PRICE_COLUMNS] for row in rows],
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def fetch_card_ids(self, version: str) -> List[str]:
+        conn = self._connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM cards WHERE version = %s ORDER BY id;", (version,))
+            return [row[0] for row in cur.fetchall()]
+
+    def init_schema(self) -> None:
+        schema_path = Path(__file__).parent / "schema" / "neon_cards.sql"
+        conn = self._connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(schema_path.read_text(encoding="utf-8"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+class MultiTarget:
+    def __init__(self, targets):
+        self.targets = targets
+
+    @property
+    def name(self) -> str:
+        return " + ".join(target.name for target in self.targets)
+
+    def upsert_set(self, row: Dict) -> None:
+        for target in self.targets:
+            target.upsert_set(row)
+
+    def upsert_card(self, row: Dict) -> None:
+        for target in self.targets:
+            target.upsert_card(row)
+
+    def replace_prices(self, card_id: str, rows: List[Dict]) -> None:
+        for target in self.targets:
+            target.replace_prices(card_id, rows)
+
+    def fetch_card_ids(self, version: str) -> List[str]:
+        ids = []
+        for target in self.targets:
+            ids.extend(target.fetch_card_ids(version))
+        return sorted(set(ids))
+
+
+def build_database_target(target_name: str):
+    targets = []
+    if target_name in ("supabase", "both"):
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY for Supabase uploads.")
+        targets.append(SupabaseTarget(SUPABASE_URL, SUPABASE_KEY))
+
+    if target_name in ("neon", "both"):
+        if not DATABASE_URL:
+            raise RuntimeError("Missing DATABASE_URL for Neon uploads.")
+        targets.append(NeonTarget(DATABASE_URL))
+
+    if len(targets) == 1:
+        return targets[0]
+    if targets:
+        return MultiTarget(targets)
+    raise RuntimeError("No database target selected.")
+
+
+def infer_default_target() -> str:
+    has_supabase = bool(SUPABASE_URL and SUPABASE_KEY)
+    has_neon = bool(DATABASE_URL)
+    if has_supabase and has_neon:
+        return "both"
+    if has_neon:
+        return "neon"
+    return "supabase"
 
 
 def get_base_url(version: str, api: str = "primary") -> str:
@@ -186,6 +390,7 @@ def transform_card_data_jpn_cards(card_data: Dict) -> Dict:
 
     # Card legalities in jpn-cards examples are in `cardLegalities`
     card_legal = card_data.get('cardLegalities') or {}
+    variants_detailed = card_data.get('variants_detailed')
 
     return {
         'id': card_data.get('id'),
@@ -493,11 +698,11 @@ def detect_data_source(data: Dict) -> str:
 
 
 def upsert_set(set_data: Dict, version: str = "international") -> bool:
-    """Insert or update a set in Supabase."""
+    """Insert or update a set."""
     try:
         source = detect_data_source(set_data)
         transformed_data = transform_set_data(set_data, version, source)
-        supabase.table('pokemon_sets').upsert(transformed_data).execute()
+        database.upsert_set(transformed_data)
         tqdm.write(f"✓ Upserted {version} set: {transformed_data['name']} (source: {source})")
         return True
     except Exception as e:
@@ -506,11 +711,11 @@ def upsert_set(set_data: Dict, version: str = "international") -> bool:
 
 
 def upsert_card(card_data: Dict, version: str = "international") -> bool:
-    """Insert or update a card in Supabase."""
+    """Insert or update a card."""
     try:
         source = detect_data_source(card_data)
         transformed_data = transform_card_data(card_data, version, source)
-        supabase.table('cards').upsert(transformed_data).execute()
+        database.upsert_card(transformed_data)
         tqdm.write(f"✓ Upserted {version} card: {transformed_data['name']} ({transformed_data['id']}) (source: {source})")
         return True
     except Exception as e:
@@ -519,7 +724,7 @@ def upsert_card(card_data: Dict, version: str = "international") -> bool:
 
 
 def upsert_prices(card_id: str, pricing_data: Dict) -> int:
-    """Insert or update card prices in Supabase."""
+    """Insert or update card prices."""
     if not pricing_data:
         return 0
 
@@ -528,16 +733,7 @@ def upsert_prices(card_id: str, pricing_data: Dict) -> int:
 
         if not price_records:
             return 0
-        # Delete existing price records for this card to avoid duplicates
-        # This replaces old pricing rows with the newly-fetched ones.
-        try:
-            supabase.table('card_prices').delete().eq('card_id', card_id).execute()
-        except Exception:
-            # If delete fails, continue to attempt insert and let the outer try/except
-            pass
-
-        # Insert new price records
-        supabase.table('card_prices').insert(price_records).execute()
+        database.replace_prices(card_id, price_records)
         tqdm.write(f"  ✓ Inserted {len(price_records)} price records for card {card_id}")
         return len(price_records)
     except Exception as e:
@@ -778,7 +974,7 @@ def seed_prices_only(version: str = "international", show_prices: bool = False):
     print(f"Updating prices only ({version})")
     print("=" * 60)
 
-    cards = supabase.table("cards").select("id").eq("version", version).execute().data
+    cards = [{"id": card_id} for card_id in database.fetch_card_ids(version)]
 
     tqdm.write(f"Found {len(cards)} cards to update prices for")
 
@@ -800,42 +996,6 @@ def seed_prices_only(version: str = "international", show_prices: bool = False):
 
 
 if __name__ == "__main__":
-    # Check for environment variables
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("=" * 60)
-        print("ERROR: Missing Supabase credentials")
-        print("=" * 60)
-        print("\nYou need to set the following environment variables:\n")
-        print("Option 1 - Using a .env file (recommended):")
-        print("  1. Create a file named '.env' in the same directory as this script")
-        print("  2. Add these lines to the file:")
-        print("     SUPABASE_URL=your-project-url")
-        print("     SUPABASE_KEY=your-anon-key")
-        print("  3. Install python-dotenv: pip install python-dotenv")
-        print("  4. Add this at the top of the script:")
-        print("     from dotenv import load_dotenv")
-        print("     load_dotenv()")
-        print("\nOption 2 - Set environment variables in terminal:")
-        print("  Windows PowerShell:")
-        print("    $env:SUPABASE_URL='your-project-url'")
-        print("    $env:SUPABASE_KEY='your-anon-key'")
-        print("\n  Windows CMD:")
-        print("    set SUPABASE_URL=your-project-url")
-        print("    set SUPABASE_KEY=your-anon-key")
-        print("\n  Linux/Mac:")
-        print("    export SUPABASE_URL='your-project-url'")
-        print("    export SUPABASE_KEY='your-anon-key'")
-        print("\nOption 3 - Hardcode in script (not recommended for production):")
-        print("  Replace lines 7-8 with:")
-        print("    SUPABASE_URL = 'your-project-url'")
-        print("    SUPABASE_KEY = 'your-anon-key'")
-        print("=" * 60)
-        exit(1)
-    
-    # Initialize Supabase client
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("✓ Successfully connected to Supabase\n")
-
     parser = argparse.ArgumentParser(description="Pokemon DB updater (sets, cards, prices)")
     parser.add_argument("--set", "-s", dest="set_id", help="Seed a single set by id (test mode)")
     parser.add_argument("--limit", "-l", dest="limit", type=int, help="Limit number of sets to process")
@@ -852,8 +1012,46 @@ if __name__ == "__main__":
         action="store_true",
         help="Print pricing data when fetched"
     )
+    parser.add_argument(
+        "--db-target",
+        choices=["supabase", "neon", "both"],
+        default=infer_default_target(),
+        help="Database upload target. Defaults to both when Supabase and Neon env vars are present."
+    )
+    parser.add_argument(
+        "--init-neon-schema",
+        action="store_true",
+        help="Create the Neon card tables from schema/neon_cards.sql, then exit."
+    )
 
     args = parser.parse_args()
+    try:
+        database = build_database_target(args.db_target)
+    except Exception as e:
+        print("=" * 60)
+        print("ERROR: Could not initialize database target")
+        print("=" * 60)
+        print(e)
+        print("\nFor Neon, add this to .env:")
+        print('  DATABASE_URL="postgresql://USER:PASSWORD@HOST/dbname?sslmode=require&channel_binding=require"')
+        print("\nFor Supabase, keep:")
+        print("  SUPABASE_URL=your-project-url")
+        print("  SUPABASE_KEY=your-service-role-or-anon-key")
+        print("=" * 60)
+        exit(1)
+
+    print(f"✓ Database target ready: {database.name}\n")
+
+    if args.init_neon_schema:
+        if args.db_target == "supabase":
+            print("Schema initialization is only for Neon. Use --db-target neon or both.")
+            exit(1)
+        neon_target = database
+        if isinstance(database, MultiTarget):
+            neon_target = next(target for target in database.targets if isinstance(target, NeonTarget))
+        neon_target.init_schema()
+        print("✓ Neon schema initialized from schema/neon_cards.sql")
+        exit(0)
 
     if args.prices_only:
         if args.version == "both":

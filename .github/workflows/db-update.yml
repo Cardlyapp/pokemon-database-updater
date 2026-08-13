@@ -11,6 +11,7 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
       POKEMON_API_KEY: ${{ secrets.POKEMON_API_KEY }}
     steps:
       - name: Checkout
@@ -41,7 +42,7 @@ jobs:
           echo "--- pip list ---"
           pip list
       - name: Run card updater
-        run: python pokemon-db-updater.py
+        run: python pokemon-db-updater.py --db-target both
       - name: Run pokedex updater
         run: python pokedex-updater.py
       - name: Run Products updater
