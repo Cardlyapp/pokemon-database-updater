@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +32,6 @@ except ImportError:
 # Configuration
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
 TCGDEX_BASE_URL_EN = "https://api.tcgdex.net/v2/en"
 TCGDEX_BASE_URL_JP = "https://api.tcgdex.net/v2/ja"
 JPN_CARDS_BASE_URL = "https://www.jpn-cards.com/v2"
@@ -89,15 +89,16 @@ class SupabaseTarget:
 
 
 class NeonTarget:
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, index: int = 1):
         if psycopg is None:
             raise RuntimeError("psycopg is not installed. Run: pip install -r requirements.txt")
         self.database_url = database_url
+        self.index = index
         self.conn = None
 
     @property
     def name(self) -> str:
-        return "Neon"
+        return f"Neon#{self.index}"
 
     def _adapt(self, column: str, value):
         if column in JSONB_COLUMNS and value is not None:
@@ -209,9 +210,11 @@ def build_database_target(target_name: str):
         targets.append(SupabaseTarget(SUPABASE_URL, SUPABASE_KEY))
 
     if target_name in ("neon", "both"):
-        if not DATABASE_URL:
-            raise RuntimeError("Missing DATABASE_URL for Neon uploads.")
-        targets.append(NeonTarget(DATABASE_URL))
+        neon_urls = get_neon_database_urls()
+        if not neon_urls:
+            raise RuntimeError("Missing DATABASE_URL, DATABASE_URL_2, or DATABASE_URLS for Neon uploads.")
+        for index, database_url in enumerate(neon_urls, 1):
+            targets.append(NeonTarget(database_url, index))
 
     if len(targets) == 1:
         return targets[0]
@@ -222,12 +225,44 @@ def build_database_target(target_name: str):
 
 def infer_default_target() -> str:
     has_supabase = bool(SUPABASE_URL and SUPABASE_KEY)
-    has_neon = bool(DATABASE_URL)
+    has_neon = bool(get_neon_database_urls())
     if has_supabase and has_neon:
         return "both"
     if has_neon:
         return "neon"
     return "supabase"
+
+
+def get_neon_database_urls() -> List[str]:
+    raw_values = []
+
+    for key in ("DATABASE_URL", "NEON_DATABASE_URL"):
+        value = os.environ.get(key)
+        if value:
+            raw_values.append(value)
+
+    for key in ("DATABASE_URLS", "NEON_DATABASE_URLS"):
+        value = os.environ.get(key)
+        if value:
+            raw_values.extend(part.strip() for part in re.split(r"[\n,;]+", value))
+
+    for index in range(2, 21):
+        values = [
+            os.environ.get(f"DATABASE_URL_{index}"),
+            os.environ.get(f"NEON_DATABASE_URL_{index}"),
+        ]
+        for value in values:
+            if value:
+                raw_values.append(value)
+
+    urls = []
+    seen = set()
+    for value in raw_values:
+        value = value.strip()
+        if value and value not in seen:
+            urls.append(value)
+            seen.add(value)
+    return urls
 
 
 def get_base_url(version: str, api: str = "primary") -> str:
@@ -1046,10 +1081,12 @@ if __name__ == "__main__":
         if args.db_target == "supabase":
             print("Schema initialization is only for Neon. Use --db-target neon or both.")
             exit(1)
-        neon_target = database
         if isinstance(database, MultiTarget):
-            neon_target = next(target for target in database.targets if isinstance(target, NeonTarget))
-        neon_target.init_schema()
+            neon_targets = [target for target in database.targets if isinstance(target, NeonTarget)]
+        else:
+            neon_targets = [database]
+        for neon_target in neon_targets:
+            neon_target.init_schema()
         print("✓ Neon schema initialized from schema/neon_cards.sql")
         exit(0)
 

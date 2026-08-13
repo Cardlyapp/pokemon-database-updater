@@ -23,7 +23,9 @@ Download set and card data from multiple sources and upsert into database tables
 Required (use `.env` file with python-dotenv):
 - `SUPABASE_URL` — your Supabase project URL
 - `SUPABASE_KEY` — your Supabase anon/service key
-- `DATABASE_URL` — your Neon Postgres connection string, required for Neon uploads
+- `DATABASE_URL` — your first Neon Postgres connection string, required for Neon uploads
+- `DATABASE_URL_2` — optional second Neon Postgres connection string
+- `DATABASE_URLS` — optional list of Neon connection strings separated by newlines, commas, or semicolons
 
 ### Dependencies
 ```bash
@@ -169,6 +171,7 @@ python pokedex-updater.py
 3. Add it to `.env`:
    ```bash
    DATABASE_URL="postgresql://USER:PASSWORD@HOST/dbname?sslmode=require&channel_binding=require"
+   DATABASE_URL_2="postgresql://USER:PASSWORD@SECOND_HOST/dbname?sslmode=require&channel_binding=require"
    ```
 4. Install dependencies:
    ```bash
@@ -180,9 +183,11 @@ python pokedex-updater.py
    python pokemon-db-updater.py --db-target neon --set base1
    ```
 
-Neon is plain Postgres, so there is no Supabase-style RLS to configure for this script. Keep `DATABASE_URL` server-side only; do not expose it in frontend code.
+For more copies, either continue with `DATABASE_URL_3`, `DATABASE_URL_4`, and so on, or use one `DATABASE_URLS` value with each connection string separated by a newline, comma, or semicolon. The updater sends the exact same rows to every Neon URL it finds.
 
-For GitHub Actions, add the same value as a repository secret named `DATABASE_URL`. If both Supabase and Neon credentials are present, `pokemon-db-updater.py` uploads cards to both by default.
+Neon is plain Postgres, so there is no Supabase-style RLS to configure for this script. Keep Neon connection strings server-side only; do not expose them in frontend code.
+
+For GitHub Actions, add repository secrets named `DATABASE_URL` and `DATABASE_URL_2` or a single `DATABASE_URLS` secret. If both Supabase and Neon credentials are present, `pokemon-db-updater.py` uploads cards to Supabase and every Neon database by default.
 
 ## Contributing
 
