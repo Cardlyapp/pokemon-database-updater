@@ -4,9 +4,13 @@
 !pokemon-db-updater.py
 !pokedex-updater.py
 !product-updater.py
+!github_catalog_updater.py
+!CATALOG_EXPORT.md
 !.github/
 !.github/**
 !requirements.txt
+!tests/
+!tests/*.py
 .vscode/
 .env
 __pycache__/

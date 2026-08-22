@@ -1,4 +1,4 @@
-name: Database Update
+name: Product Update
 
 on:
   schedule:
@@ -6,15 +6,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  update-db:
+  update-products:
     runs-on: ubuntu-latest
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
-      DATABASE_URLS: ${{ secrets.DATABASE_URLS }}
-      POKEMON_API_KEY: ${{ secrets.POKEMON_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,17 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt --verbose; fi
+          pip install -r requirements.txt --verbose
 
-      - name: Show installed packages (debug)
-        run: |
-          echo "--- pip version ---"
-          pip --version
-          echo "--- pip list ---"
-          pip list
-      - name: Run card updater
-        run: python pokemon-db-updater.py --db-target both --version both
-      - name: Run pokedex updater
-        run: python pokedex-updater.py
-      - name: Run Products updater
+      - name: Run product updater
         run: python product-updater.py

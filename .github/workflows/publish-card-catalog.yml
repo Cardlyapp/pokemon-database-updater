@@ -1,0 +1,55 @@
+name: Publish Card Catalog
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+      timezone: "America/New_York"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-card-catalog
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out updater
+        uses: actions/checkout@v4
+
+      - name: Check out cards database
+        uses: actions/checkout@v4
+        with:
+          repository: Cardlyapp/cards-database
+          token: ${{ secrets.CARDS_DATABASE_TOKEN }}
+          path: cards-database
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export catalog directly from source APIs
+        run: python github_catalog_updater.py --output cards-database
+
+      - name: Commit and push changed catalog
+        working-directory: cards-database
+        shell: bash
+        run: |
+          git config user.name "cardly-catalog-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add manifest.json data/sets.json data/cards.json data-asia/sets.json data-asia/cards.json
+          if git diff --cached --quiet; then
+            echo "Catalog source data has not changed."
+            exit 0
+          fi
+          git commit -m "Update card catalog"
+          git push
