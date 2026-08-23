@@ -22,7 +22,7 @@ class FakeSource:
     def fetch_cards_in_set(self, set_id, version):
         return [{"id": "card-1"}]
 
-    def fetch_card_details(self, card_id, version):
+    def fetch_card_details(self, card_id, version, set_id=None, local_id=None):
         return {"id": card_id, "name": "Pikachu"}
 
     def detect_data_source(self, row):

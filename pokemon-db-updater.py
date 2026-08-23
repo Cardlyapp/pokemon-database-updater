@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import argparse
+from urllib.parse import quote, unquote
 from tqdm import tqdm
 
 try:
@@ -377,7 +378,12 @@ def fetch_cards_in_set(set_id: str, version: str = "international") -> List[Dict
     return set_data.get('cards', [])
 
 
-def fetch_card_details(card_id: str, version: str = "international") -> Dict:
+def fetch_card_details(
+    card_id: str,
+    version: str = "international",
+    set_id: Optional[str] = None,
+    local_id: Optional[str] = None,
+) -> Dict:
     """Fetch detailed information for a specific card."""
     if version == "japan":
         # Try jpn-cards first
@@ -389,7 +395,20 @@ def fetch_card_details(card_id: str, version: str = "international") -> Dict:
 
     base_url = get_base_url(version, "fallback")
     response = requests.get(f"{base_url}/cards/{card_id}")
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        # Some valid local IDs contain URL-reserved characters (for example
+        # the "?" Unown in set exu). TCGdex stores those characters escaped in
+        # the logical card ID, so the percent sign must itself be escaped in
+        # the request path: exu-? -> exu-%3F -> /cards/exu-%253F.
+        if response.status_code != 404 or not set_id or local_id is None:
+            raise
+        canonical_local_id = quote(unquote(str(local_id)), safe="")
+        canonical_card_id = f"{set_id}-{canonical_local_id}"
+        encoded_card_id = quote(canonical_card_id, safe="")
+        response = requests.get(f"{base_url}/cards/{encoded_card_id}")
+        response.raise_for_status()
     return response.json()
 
 

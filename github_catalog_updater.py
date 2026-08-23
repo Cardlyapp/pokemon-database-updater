@@ -113,7 +113,13 @@ def export_region(
             if not isinstance(card_summary, dict):
                 raise RuntimeError(f"Set {set_id} returned an invalid card summary")
             card_source_id = stable_id(card_summary.get("id") or card_summary.get("uuid"), "card")
-            details_card = source.fetch_card_details(card_source_id, version)
+            local_id = card_summary.get("localId") or card_summary.get("local_id")
+            details_card = source.fetch_card_details(
+                card_source_id,
+                version,
+                set_id=summary_id,
+                local_id=local_id,
+            )
             if not isinstance(details_card, dict):
                 raise RuntimeError(f"Could not fetch complete details for {version} card {card_source_id}")
             card_source = source.detect_data_source(details_card)
