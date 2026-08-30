@@ -184,6 +184,77 @@ def export_region(
     }
 
 
+def read_json_list(path: Path, label: str) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not load {label} from {path}: {exc}") from exc
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"The existing {label} is empty or invalid: {path}")
+    if not all(isinstance(row, dict) for row in value):
+        raise RuntimeError(f"The existing {label} contains an invalid row: {path}")
+    return value
+
+
+def export_region_prices(
+    source: ModuleType,
+    version: str,
+    output_root: Path,
+    request_delay: float = 0.05,
+) -> dict[str, Any]:
+    """Refresh prices while preserving the existing release-gated sets and cards."""
+    directory_name = REGIONS[version]
+    region_dir = output_root / directory_name
+    sets_path = region_dir / "sets.json"
+    cards_path = region_dir / "cards.json"
+    prices_path = region_dir / "prices.json"
+    sets = read_json_list(sets_path, f"{version} sets")
+    cards = read_json_list(cards_path, f"{version} cards")
+    prices: list[dict[str, Any]] = []
+
+    print(f"Refreshing prices for {len(cards)} existing {version} cards...")
+    for card_index, card in enumerate(cards, 1):
+        card_id = stable_id(card.get("id"), "card")
+        details = source.fetch_card_details(
+            card_id,
+            version,
+            set_id=card.get("set_id"),
+            local_id=card.get("local_id") or card.get("localId") or card.get("number"),
+        )
+        if not isinstance(details, dict):
+            raise RuntimeError(f"Could not fetch pricing details for {version} card {card_id}")
+        pricing = details.get("pricing")
+        if isinstance(pricing, dict):
+            prices.extend(clean_export_row(row) for row in source.transform_price_data(card_id, pricing))
+
+        if request_delay > 0:
+            time.sleep(request_delay)
+        if card_index % 100 == 0:
+            print(f"  Refreshed {card_index}/{len(cards)} card prices")
+
+    prices.sort(
+        key=lambda row: (
+            stable_id(row.get("card_id"), "price card"),
+            str(row.get("market_source") or ""),
+            str(row.get("condition") or ""),
+            str(row.get("price_type") or ""),
+        )
+    )
+    write_json_atomic(prices_path, prices)
+    print(f"Captured {len(prices)} price rows for {version}; sets and cards were not rebuilt")
+
+    return {
+        "version": version,
+        "directory": directory_name,
+        "setCount": len(sets),
+        "cardCount": len(cards),
+        "priceCount": len(prices),
+        "sets": file_metadata(output_root, sets_path),
+        "cards": file_metadata(output_root, cards_path),
+        "prices": file_metadata(output_root, prices_path),
+    }
+
+
 def canonical_json_bytes(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
 
@@ -209,27 +280,39 @@ def content_version(regions: Iterable[dict[str, Any]]) -> str:
     return hashlib.sha256("".join(hashes).encode("ascii")).hexdigest()
 
 
-def existing_publication_time(output_root: Path, version: str) -> str | None:
+def existing_manifest(output_root: Path) -> dict[str, Any]:
     manifest_path = output_root / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def existing_publication_time(output_root: Path, version: str) -> str | None:
+    manifest = existing_manifest(output_root)
     if manifest.get("version") == version:
         value = manifest.get("publishedAt")
         return value if isinstance(value, str) else None
     return None
 
 
-def publish_manifest(output_root: Path, regions: list[dict[str, Any]]) -> dict[str, Any]:
+def publish_manifest(
+    output_root: Path,
+    regions: list[dict[str, Any]],
+    tcgdex_release: str | None = None,
+) -> dict[str, Any]:
     version = content_version(regions)
     published_at = existing_publication_time(output_root, version) or datetime.now(timezone.utc).isoformat()
+    tcgdex_release = tcgdex_release or existing_manifest(output_root).get("tcgdexRelease")
     manifest = {
         "schemaVersion": SCHEMA_VERSION,
         "version": version,
         "publishedAt": published_at,
         "regions": {region["version"]: region for region in regions},
     }
+    if tcgdex_release:
+        manifest["tcgdexRelease"] = tcgdex_release
     write_json_atomic(output_root / "manifest.json", manifest)
     return manifest
 
@@ -246,6 +329,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--region", choices=("both", "international", "japan"), default="both")
     parser.add_argument("--limit-sets", type=int, help="Testing only: export the first N sets")
     parser.add_argument("--request-delay", type=float, default=0.05)
+    parser.add_argument(
+        "--prices-only",
+        action="store_true",
+        help="Refresh prices from existing catalog cards without rebuilding sets or cards",
+    )
+    parser.add_argument(
+        "--tcgdex-release",
+        help="TCGdex cards-database release tag represented by this catalog",
+    )
     return parser.parse_args(argv)
 
 
@@ -255,16 +347,24 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--limit-sets must be at least 1")
     if args.request_delay < 0:
         raise ValueError("--request-delay cannot be negative")
+    if args.prices_only and args.limit_sets is not None:
+        raise ValueError("--prices-only cannot be combined with --limit-sets")
 
     output_root = args.output.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     source = load_source_module(args.source_module.resolve())
     versions = REGIONS if args.region == "both" else (args.region,)
-    regions = [
-        export_region(source, version, output_root, args.limit_sets, args.request_delay)
-        for version in versions
-    ]
-    manifest = publish_manifest(output_root, regions)
+    if args.prices_only:
+        regions = [
+            export_region_prices(source, version, output_root, args.request_delay)
+            for version in versions
+        ]
+    else:
+        regions = [
+            export_region(source, version, output_root, args.limit_sets, args.request_delay)
+            for version in versions
+        ]
+    manifest = publish_manifest(output_root, regions, args.tcgdex_release)
     print(
         f"Catalog {manifest['version'][:12]} ready: "
         + ", ".join(f"{row['version']}={row['cardCount']} cards" for row in regions)

@@ -1,10 +1,10 @@
-name: Card Database Update
+name: Card Price Update
 
 on:
   workflow_dispatch:
 
 jobs:
-  update-cards:
+  update-prices:
     runs-on: ubuntu-latest
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -35,10 +35,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt --verbose
 
-      - name: Run card updater
+      - name: Update prices from the published catalog
         run: >-
           python pokemon-db-updater.py
           --catalog-url "$CARD_CATALOG_URL"
+          --prices-only
           --db-target both
           --version both
           --batch-size 100

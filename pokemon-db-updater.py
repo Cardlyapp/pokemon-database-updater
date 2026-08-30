@@ -990,6 +990,35 @@ def seed_from_catalog(
     print(f"Completed bulk load for {version}")
 
 
+def seed_prices_from_catalog(
+    catalog_root: Path,
+    version: str,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    prices_root: Optional[Path] = None,
+) -> None:
+    """Replace prices from a catalog without writing any set or card rows."""
+    _, cards = load_catalog_region(catalog_root, version)
+    prices = load_catalog_prices(prices_root or catalog_root, version)
+    known_card_ids = {row["id"] for row in cards}
+    unknown_prices = {row["card_id"] for row in prices} - known_card_ids
+    if unknown_prices:
+        raise RuntimeError(f"Catalog prices reference unknown cards: {sorted(unknown_prices)[0]}")
+
+    prices_by_card = {}
+    for row in prices:
+        prices_by_card.setdefault(row["card_id"], []).append(row)
+    print(f"Loading {len(prices)} prices for {len(cards)} existing {version} cards")
+    for card_rows in tqdm(
+        list(batched(cards, batch_size)),
+        desc=f"Price batches ({version})",
+        unit="batch",
+    ):
+        card_ids = [row["id"] for row in card_rows]
+        batch_prices = [row for card_id in card_ids for row in prices_by_card.get(card_id, [])]
+        database.replace_prices_bulk(card_ids, batch_prices)
+    print(f"Completed price-only catalog load for {version}")
+
+
 def upsert_set(set_data: Dict, version: str = "international") -> bool:
     """Insert or update a set."""
     try:
@@ -1364,8 +1393,8 @@ if __name__ == "__main__":
         parser.error("--expected-catalog-manifest requires --catalog-url")
     if args.prices_catalog and not (args.catalog or args.catalog_url):
         parser.error("--prices-catalog requires --catalog or --catalog-url")
-    if (args.catalog or args.catalog_url) and (args.set_id or args.limit or args.prices_only):
-        parser.error("Catalog loading cannot be combined with --set, --limit, or --prices-only")
+    if (args.catalog or args.catalog_url) and (args.set_id or args.limit):
+        parser.error("Catalog loading cannot be combined with --set or --limit")
     try:
         database = build_database_target(args.db_target)
     except Exception as e:
@@ -1415,7 +1444,8 @@ if __name__ == "__main__":
                 catalog_root = args.catalog.resolve()
             versions = ("international", "japan") if args.version == "both" else (args.version,)
             for version in versions:
-                seed_from_catalog(
+                load_function = seed_prices_from_catalog if args.prices_only else seed_from_catalog
+                load_function(
                     catalog_root,
                     version,
                     batch_size=args.batch_size,

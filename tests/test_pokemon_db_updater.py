@@ -184,6 +184,30 @@ class CatalogLoadTests(unittest.TestCase):
             self.assertEqual(recording.price_batches[0][1][0]["card_id"], "card-0")
             self.assertNotIn("card_count", recording.set_batches[0][0])
 
+    def test_price_only_catalog_load_does_not_write_sets_or_cards(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "data").mkdir()
+            sets = [{"id": "set-1", "name": "Set"}]
+            cards = [{"id": "card-1", "set_id": "set-1"}]
+            prices = [{"card_id": "card-1", "market_source": "fake", "price_type": "normal"}]
+            (root / "data" / "sets.json").write_text(json.dumps(sets), encoding="utf-8")
+            (root / "data" / "cards.json").write_text(json.dumps(cards), encoding="utf-8")
+            (root / "data" / "prices.json").write_text(json.dumps(prices), encoding="utf-8")
+
+            recording = RecordingDatabase()
+            previous = MODULE.database
+            MODULE.database = recording
+            try:
+                MODULE.seed_prices_from_catalog(root, "international", batch_size=100)
+            finally:
+                MODULE.database = previous
+
+            self.assertEqual(recording.set_batches, [])
+            self.assertEqual(recording.card_batches, [])
+            self.assertEqual(recording.price_batches[0][0], ["card-1"])
+            self.assertEqual(recording.price_batches[0][1][0]["card_id"], "card-1")
+
     def test_neon_card_batch_uses_one_transaction(self):
         connection = FakeConnection()
         target = MODULE.NeonTarget.__new__(MODULE.NeonTarget)

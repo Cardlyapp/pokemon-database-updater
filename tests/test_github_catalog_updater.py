@@ -63,6 +63,38 @@ class CatalogExportTests(unittest.TestCase):
             self.assertEqual(second["version"], manifest["version"])
             self.assertEqual(second["publishedAt"], manifest["publishedAt"])
 
+    def test_price_only_export_preserves_cards_sets_and_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            region_dir = root / "data"
+            region_dir.mkdir()
+            sets = [{"id": "set-1", "name": "First Set"}]
+            cards = [{"id": "card-1", "set_id": "set-1", "local_id": "1"}]
+            MODULE.write_json_atomic(region_dir / "sets.json", sets)
+            MODULE.write_json_atomic(region_dir / "cards.json", cards)
+            MODULE.write_json_atomic(region_dir / "prices.json", [])
+            initial_region = {
+                "version": "international",
+                "directory": "data",
+                "setCount": 1,
+                "cardCount": 1,
+                "priceCount": 0,
+                "sets": MODULE.file_metadata(root, region_dir / "sets.json"),
+                "cards": MODULE.file_metadata(root, region_dir / "cards.json"),
+                "prices": MODULE.file_metadata(root, region_dir / "prices.json"),
+            }
+            MODULE.publish_manifest(root, [initial_region], "v2.47.0")
+            original_sets = (region_dir / "sets.json").read_bytes()
+            original_cards = (region_dir / "cards.json").read_bytes()
+
+            region = MODULE.export_region_prices(FakeSource(), "international", root, request_delay=0)
+            manifest = MODULE.publish_manifest(root, [region])
+
+            self.assertEqual((region_dir / "sets.json").read_bytes(), original_sets)
+            self.assertEqual((region_dir / "cards.json").read_bytes(), original_cards)
+            self.assertEqual(manifest["tcgdexRelease"], "v2.47.0")
+            self.assertEqual(manifest["regions"]["international"]["priceCount"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

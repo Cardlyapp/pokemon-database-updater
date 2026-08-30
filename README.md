@@ -16,7 +16,9 @@ This workspace contains tools to fetch Pokémon card data and Pokémon species d
 Download set, card, and price data from the published GitHub Pages catalog and
 upsert it into database tables (`pokemon_sets`, `cards`, `card_prices`) in
 batches. The catalog publisher remains responsible for the slower upstream API
-fetch, so the same source pass feeds Supabase and every Neon database.
+fetch, so the same source pass feeds Supabase and every Neon database. Scheduled
+set/card refreshes run only for a new `tcgdex/cards-database` release; prices
+refresh on every scheduled catalog run.
 
 ### Data Sources
 - **International cards**: TCGdex API (`https://api.tcgdex.net/v2/en`)
@@ -60,6 +62,11 @@ python pokemon-db-updater.py --catalog-url https://cardlyapp.github.io/cards-dat
 **Bulk-load a checked-out catalog:**
 ```bash
 python pokemon-db-updater.py --catalog ./cards-database --db-target both --version both
+```
+
+**Update only prices from a catalog:**
+```bash
+python pokemon-db-updater.py --catalog ./cards-database --prices-only --db-target both --version both
 ```
 
 **Seed a single set (testing):**
