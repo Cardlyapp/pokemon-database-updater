@@ -21,7 +21,7 @@ from types import ModuleType
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REGIONS = {
     "international": "data",
     "japan": "data-asia",
@@ -80,6 +80,7 @@ def export_region(
 
     sets: list[dict[str, Any]] = []
     cards: list[dict[str, Any]] = []
+    prices: list[dict[str, Any]] = []
     seen_set_ids: set[str] = set()
     seen_card_ids: set[str] = set()
 
@@ -134,6 +135,9 @@ def export_region(
             card_row["set_name"] = card_row.get("set_name") or set_row.get("name")
             card_row["version"] = version
             cards.append(card_row)
+            pricing = details_card.get("pricing")
+            if isinstance(pricing, dict):
+                prices.extend(clean_export_row(row) for row in source.transform_price_data(card_id, pricing))
             set_card_count += 1
 
             if request_delay > 0:
@@ -157,14 +161,26 @@ def export_region(
     region_dir.mkdir(parents=True, exist_ok=True)
     write_json_atomic(region_dir / "sets.json", sets)
     write_json_atomic(region_dir / "cards.json", cards)
+    prices.sort(
+        key=lambda row: (
+            stable_id(row.get("card_id"), "price card"),
+            str(row.get("market_source") or ""),
+            str(row.get("condition") or ""),
+            str(row.get("price_type") or ""),
+        )
+    )
+    write_json_atomic(region_dir / "prices.json", prices)
+    print(f"Captured {len(prices)} price rows for {version}")
 
     return {
         "version": version,
         "directory": directory_name,
         "setCount": len(sets),
         "cardCount": len(cards),
+        "priceCount": len(prices),
         "sets": file_metadata(output_root, region_dir / "sets.json"),
         "cards": file_metadata(output_root, region_dir / "cards.json"),
+        "prices": file_metadata(output_root, region_dir / "prices.json"),
     }
 
 
@@ -189,7 +205,7 @@ def file_metadata(root: Path, path: Path) -> dict[str, Any]:
 
 
 def content_version(regions: Iterable[dict[str, Any]]) -> str:
-    hashes = [item[kind]["sha256"] for item in regions for kind in ("sets", "cards")]
+    hashes = [item[kind]["sha256"] for item in regions for kind in ("sets", "cards", "prices")]
     return hashlib.sha256("".join(hashes).encode("ascii")).hexdigest()
 
 

@@ -1,4 +1,7 @@
 import importlib.util
+import hashlib
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -54,6 +57,180 @@ class CardDetailFetchTests(unittest.TestCase):
                 MODULE.fetch_card_details("exu-?", set_id="exu", local_id="?")
 
         get.assert_called_once()
+
+
+class JapaneseSetAliasTests(unittest.TestCase):
+    def test_japanese_plus_set_detail_uses_card_bearing_tcgdex_id(self):
+        missing_jpn_cards = Mock()
+        missing_jpn_cards.raise_for_status.side_effect = requests.HTTPError("not found")
+        found = Mock()
+        found.raise_for_status.return_value = None
+        found.json.return_value = {"id": "SM1p", "cards": []}
+
+        with patch.object(MODULE.requests, "get", side_effect=[missing_jpn_cards, found]) as get:
+            result = MODULE.fetch_set_details("SM1+", "japan")
+
+        self.assertEqual(result["id"], "SM1p")
+        self.assertEqual(
+            get.call_args_list[1].args[0],
+            "https://api.tcgdex.net/v2/ja/sets/SM1p",
+        )
+
+    def test_japanese_plus_set_card_fallback_uses_card_bearing_tcgdex_id(self):
+        missing_jpn_cards = Mock()
+        missing_jpn_cards.raise_for_status.side_effect = requests.HTTPError("not found")
+        found = Mock()
+        found.raise_for_status.return_value = None
+        found.json.return_value = {"id": "SM1p", "cards": [{"id": "SM1p-001"}]}
+
+        with patch.object(MODULE.requests, "get", side_effect=[missing_jpn_cards, found]) as get:
+            result = MODULE.fetch_cards_in_set("SM1+", "japan")
+
+        self.assertEqual(result, [{"id": "SM1p-001"}])
+        self.assertEqual(
+            get.call_args_list[1].args[0],
+            "https://api.tcgdex.net/v2/ja/sets/SM1p",
+        )
+
+    def test_tcgdex_set_index_collapses_plus_alias(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [
+            {"id": "SM1+", "name": "Sun & Moon"},
+            {"id": "SM1p", "name": "Sun & Moon"},
+            {"id": "SM1M", "name": "Collection Moon"},
+        ]
+
+        with patch.object(MODULE, "fetch_all_sets_jpn_cards", return_value=None):
+            with patch.object(MODULE.requests, "get", return_value=response):
+                result = MODULE.fetch_all_sets("japan")
+
+        self.assertEqual([row["id"] for row in result], ["SM1p", "SM1M"])
+
+
+class RecordingDatabase:
+    def __init__(self):
+        self.set_batches = []
+        self.card_batches = []
+        self.price_batches = []
+
+    def upsert_sets(self, rows):
+        self.set_batches.append(rows)
+
+    def upsert_cards(self, rows):
+        self.card_batches.append(rows)
+
+    def replace_prices_bulk(self, card_ids, rows):
+        self.price_batches.append((card_ids, rows))
+
+
+class FakeCursor:
+    def __init__(self):
+        self.executemany_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def executemany(self, query, values):
+        self.executemany_calls.append((query, values))
+
+
+class FakeConnection:
+    closed = False
+
+    def __init__(self):
+        self.current_cursor = FakeCursor()
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        return self.current_cursor
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class CatalogLoadTests(unittest.TestCase):
+    def test_catalog_is_loaded_in_batches_with_prices(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "data").mkdir()
+            prices_root = root / "private"
+            (prices_root / "data").mkdir(parents=True)
+            sets = [{"id": "set-1", "name": "Set", "card_count": 3}]
+            cards = [{"id": f"card-{number}", "set_id": "set-1"} for number in range(3)]
+            prices = [{"card_id": "card-0", "market_source": "fake", "price_type": "normal"}]
+            (root / "data" / "sets.json").write_text(json.dumps(sets), encoding="utf-8")
+            (root / "data" / "cards.json").write_text(json.dumps(cards), encoding="utf-8")
+            (prices_root / "data" / "prices.json").write_text(json.dumps(prices), encoding="utf-8")
+
+            recording = RecordingDatabase()
+            previous = MODULE.database
+            MODULE.database = recording
+            try:
+                MODULE.seed_from_catalog(root, "international", batch_size=2, prices_root=prices_root)
+            finally:
+                MODULE.database = previous
+
+            self.assertEqual([len(rows) for rows in recording.set_batches], [1])
+            self.assertEqual([len(rows) for rows in recording.card_batches], [2, 1])
+            self.assertEqual([len(ids) for ids, _ in recording.price_batches], [2, 1])
+            self.assertEqual(recording.price_batches[0][1][0]["card_id"], "card-0")
+            self.assertNotIn("card_count", recording.set_batches[0][0])
+
+    def test_neon_card_batch_uses_one_transaction(self):
+        connection = FakeConnection()
+        target = MODULE.NeonTarget.__new__(MODULE.NeonTarget)
+        target.conn = connection
+        target.database_url = "unused"
+        target.index = 1
+        target.upsert_cards([{"id": "card-1"}, {"id": "card-2"}])
+
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(connection.rollbacks, 0)
+        self.assertEqual(len(connection.current_cursor.executemany_calls), 1)
+        self.assertEqual(len(connection.current_cursor.executemany_calls[0][1]), 2)
+
+    def test_github_pages_catalog_download_is_hash_verified(self):
+        files = {
+            "data/sets.json": b'[{"id":"set-1"}]',
+            "data/cards.json": b'[{"id":"card-1"}]',
+            "data/prices.json": b'[]',
+        }
+        manifest = {
+            "version": "catalog-version",
+            "regions": {
+                "international": {
+                    kind: {"path": path, "sha256": hashlib.sha256(content).hexdigest()}
+                    for kind, (path, content) in zip(("sets", "cards", "prices"), files.items())
+                }
+            },
+        }
+        manifest_response = Mock()
+        manifest_response.raise_for_status.return_value = None
+        manifest_response.json.return_value = manifest
+        file_responses = []
+        for content in files.values():
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.content = content
+            file_responses.append(response)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(MODULE.requests, "get", side_effect=[manifest_response, *file_responses]):
+                result = MODULE.download_catalog(
+                    "https://example.test/catalog",
+                    Path(temporary),
+                    expected_version="catalog-version",
+                    retry_delay=0,
+                )
+            self.assertEqual((result / "data" / "cards.json").read_bytes(), files["data/cards.json"])
 
 
 if __name__ == "__main__":

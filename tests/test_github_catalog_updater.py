@@ -23,7 +23,7 @@ class FakeSource:
         return [{"id": "card-1"}]
 
     def fetch_card_details(self, card_id, version, set_id=None, local_id=None):
-        return {"id": card_id, "name": "Pikachu"}
+        return {"id": card_id, "name": "Pikachu", "pricing": {"market": 1}}
 
     def detect_data_source(self, row):
         return "fake"
@@ -33,6 +33,9 @@ class FakeSource:
 
     def transform_card_data(self, row, version, source):
         return {"id": row["id"], "name": row["name"], "set_id": None, "version": version, "updated_at": "changes"}
+
+    def transform_price_data(self, card_id, pricing):
+        return [{"card_id": card_id, "market_source": "fake", "price_type": "normal", "updated_at": "changes"}]
 
 
 class CatalogExportTests(unittest.TestCase):
@@ -48,7 +51,13 @@ class CatalogExportTests(unittest.TestCase):
             self.assertEqual(cards[0]["set_id"], "set-1")
             self.assertNotIn("updated_at", sets[0])
             self.assertNotIn("updated_at", cards[0])
+            self.assertNotIn("pricing", cards[0])
             self.assertEqual(manifest["regions"]["international"]["cardCount"], 1)
+            prices = json.loads((root / "data" / "prices.json").read_text(encoding="utf-8"))
+            self.assertEqual(prices[0]["card_id"], "card-1")
+            self.assertNotIn("updated_at", prices[0])
+            self.assertEqual(manifest["regions"]["international"]["priceCount"], 1)
+            self.assertEqual(manifest["schemaVersion"], 2)
 
             second = MODULE.publish_manifest(root, [region])
             self.assertEqual(second["version"], manifest["version"])

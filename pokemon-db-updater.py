@@ -1,12 +1,15 @@
 import os
 import re
+import json
+import hashlib
+import tempfile
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import argparse
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urljoin
 from tqdm import tqdm
 
 try:
@@ -62,6 +65,8 @@ JSONB_COLUMNS = {
     "images", "legalities", "subtypes", "types", "variants", "variants_detailed",
 }
 
+DEFAULT_BATCH_SIZE = 100
+
 
 class SupabaseTarget:
     def __init__(self, url: str, key: str):
@@ -74,13 +79,26 @@ class SupabaseTarget:
         return "Supabase"
 
     def upsert_set(self, row: Dict) -> None:
-        self.client.table("pokemon_sets").upsert(row).execute()
+        self.upsert_sets([row])
+
+    def upsert_sets(self, rows: List[Dict]) -> None:
+        if rows:
+            self.client.table("pokemon_sets").upsert(rows).execute()
 
     def upsert_card(self, row: Dict) -> None:
-        self.client.table("cards").upsert(row).execute()
+        self.upsert_cards([row])
+
+    def upsert_cards(self, rows: List[Dict]) -> None:
+        if rows:
+            self.client.table("cards").upsert(rows).execute()
 
     def replace_prices(self, card_id: str, rows: List[Dict]) -> None:
-        self.client.table("card_prices").delete().eq("card_id", card_id).execute()
+        self.replace_prices_bulk([card_id], rows)
+
+    def replace_prices_bulk(self, card_ids: List[str], rows: List[Dict]) -> None:
+        if not card_ids:
+            return
+        self.client.table("card_prices").delete().in_("card_id", card_ids).execute()
         if rows:
             self.client.table("card_prices").insert(rows).execute()
 
@@ -111,14 +129,17 @@ class NeonTarget:
             self.conn = psycopg.connect(self.database_url)
         return self.conn
 
-    def _upsert(self, table: str, row: Dict, columns: List[str], conflict_columns: List[str]) -> None:
+    def _upsert_many(
+        self, table: str, rows: List[Dict], columns: List[str], conflict_columns: List[str]
+    ) -> None:
+        if not rows:
+            return
         placeholders = ", ".join(["%s"] * len(columns))
         column_sql = ", ".join(columns)
         conflict_sql = ", ".join(conflict_columns)
         update_sql = ", ".join(
             [f"{column} = EXCLUDED.{column}" for column in columns if column not in conflict_columns]
         )
-        values = [self._adapt(column, row.get(column)) for column in columns]
         query = f"""
             INSERT INTO {table} ({column_sql})
             VALUES ({placeholders})
@@ -129,23 +150,37 @@ class NeonTarget:
         conn = self._connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(query, values)
+                cur.executemany(
+                    query,
+                    [[self._adapt(column, row.get(column)) for column in columns] for row in rows],
+                )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
 
     def upsert_set(self, row: Dict) -> None:
-        self._upsert("pokemon_sets", row, SET_COLUMNS, ["id"])
+        self.upsert_sets([row])
+
+    def upsert_sets(self, rows: List[Dict]) -> None:
+        self._upsert_many("pokemon_sets", rows, SET_COLUMNS, ["id"])
 
     def upsert_card(self, row: Dict) -> None:
-        self._upsert("cards", row, CARD_COLUMNS, ["id"])
+        self.upsert_cards([row])
+
+    def upsert_cards(self, rows: List[Dict]) -> None:
+        self._upsert_many("cards", rows, CARD_COLUMNS, ["id"])
 
     def replace_prices(self, card_id: str, rows: List[Dict]) -> None:
+        self.replace_prices_bulk([card_id], rows)
+
+    def replace_prices_bulk(self, card_ids: List[str], rows: List[Dict]) -> None:
+        if not card_ids:
+            return
         conn = self._connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM card_prices WHERE card_id = %s;", (card_id,))
+                cur.execute("DELETE FROM card_prices WHERE card_id = ANY(%s);", (card_ids,))
                 if rows:
                     placeholders = ", ".join(["%s"] * len(PRICE_COLUMNS))
                     query = f"INSERT INTO card_prices ({', '.join(PRICE_COLUMNS)}) VALUES ({placeholders});"
@@ -188,13 +223,25 @@ class MultiTarget:
         for target in self.targets:
             target.upsert_set(row)
 
+    def upsert_sets(self, rows: List[Dict]) -> None:
+        for target in self.targets:
+            target.upsert_sets(rows)
+
     def upsert_card(self, row: Dict) -> None:
         for target in self.targets:
             target.upsert_card(row)
 
+    def upsert_cards(self, rows: List[Dict]) -> None:
+        for target in self.targets:
+            target.upsert_cards(rows)
+
     def replace_prices(self, card_id: str, rows: List[Dict]) -> None:
         for target in self.targets:
             target.replace_prices(card_id, rows)
+
+    def replace_prices_bulk(self, card_ids: List[str], rows: List[Dict]) -> None:
+        for target in self.targets:
+            target.replace_prices_bulk(card_ids, rows)
 
     def fetch_card_ids(self, version: str) -> List[str]:
         ids = []
@@ -273,6 +320,45 @@ def get_base_url(version: str, api: str = "primary") -> str:
     return TCGDEX_BASE_URL_EN
 
 
+def normalize_tcgdex_set_id(set_id: str, version: str) -> str:
+    """Map printed Japanese set codes to TCGdex's card-bearing set IDs."""
+    value = str(set_id)
+    if version == "japan" and re.fullmatch(r"SM\d+\+", value, re.IGNORECASE):
+        # TCGdex can expose printed codes such as SM1+ in its set index while
+        # the detailed set and card IDs use SM1p. Normalize the alias before
+        # requesting a detail route so an orphan index entry cannot abort an
+        # otherwise complete catalog export.
+        return f"{value[:-1]}p"
+    return value
+
+
+def normalize_tcgdex_set_summaries(sets: List[Dict], version: str) -> List[Dict]:
+    """Normalize TCGdex set IDs and collapse aliases that resolve identically."""
+    if version != "japan":
+        return sets
+
+    normalized = []
+    canonical_ids = {
+        str(row['id'])
+        for row in sets
+        if isinstance(row, dict)
+        and row.get('id')
+        and normalize_tcgdex_set_id(row['id'], version) == str(row['id'])
+    }
+    for row in sets:
+        if not isinstance(row, dict) or not row.get('id'):
+            normalized.append(row)
+            continue
+        normalized_id = normalize_tcgdex_set_id(row['id'], version)
+        if normalized_id != str(row['id']) and normalized_id in canonical_ids:
+            print(f"Skipping duplicate {version} TCGdex set alias: {row['id']}")
+            continue
+        clean_row = dict(row)
+        clean_row['id'] = normalized_id
+        normalized.append(clean_row)
+    return normalized
+
+
 def fetch_all_sets_jpn_cards() -> List[Dict]:
     """Fetch all Pokemon card sets from jpn-cards API."""
     print("Fetching all Japanese sets from jpn-cards API...")
@@ -335,7 +421,7 @@ def fetch_all_sets(version: str = "international") -> List[Dict]:
     print(f"Fetching all {version} sets from TCGdex...")
     response = requests.get(f"{base_url}/sets")
     response.raise_for_status()
-    return response.json()
+    return normalize_tcgdex_set_summaries(response.json(), version)
 
 
 def fetch_set_details(set_id: str, version: str = "international") -> Dict:
@@ -349,8 +435,9 @@ def fetch_set_details(set_id: str, version: str = "international") -> Dict:
         print(f"Falling back to TCGdex for set: {set_id}")
 
     base_url = get_base_url(version, "fallback")
-    print(f"Fetching {version} set details from TCGdex for: {set_id}")
-    response = requests.get(f"{base_url}/sets/{set_id}")
+    tcgdex_set_id = normalize_tcgdex_set_id(set_id, version)
+    print(f"Fetching {version} set details from TCGdex for: {tcgdex_set_id}")
+    response = requests.get(f"{base_url}/sets/{quote(tcgdex_set_id, safe='')}")
     response.raise_for_status()
     return response.json()
 
@@ -371,8 +458,9 @@ def fetch_cards_in_set(set_id: str, version: str = "international") -> List[Dict
 
 
     base_url = get_base_url(version, "fallback")
-    print(f"Fetching {version} cards for set from TCGdex: {set_id}")
-    response = requests.get(f"{base_url}/sets/{set_id}")
+    tcgdex_set_id = normalize_tcgdex_set_id(set_id, version)
+    print(f"Fetching {version} cards for set from TCGdex: {tcgdex_set_id}")
+    response = requests.get(f"{base_url}/sets/{quote(tcgdex_set_id, safe='')}")
     response.raise_for_status()
     set_data = response.json()
     return set_data.get('cards', [])
@@ -405,7 +493,8 @@ def fetch_card_details(
         if response.status_code != 404 or not set_id or local_id is None:
             raise
         canonical_local_id = quote(unquote(str(local_id)), safe="")
-        canonical_card_id = f"{set_id}-{canonical_local_id}"
+        canonical_set_id = normalize_tcgdex_set_id(set_id, version)
+        canonical_card_id = f"{canonical_set_id}-{canonical_local_id}"
         encoded_card_id = quote(canonical_card_id, safe="")
         response = requests.get(f"{base_url}/cards/{encoded_card_id}")
         response.raise_for_status()
@@ -751,6 +840,156 @@ def detect_data_source(data: Dict) -> str:
     return "tcgdex"
 
 
+def batched(rows: List[Dict], batch_size: int):
+    """Yield bounded chunks so hosted database APIs receive manageable payloads."""
+    for start in range(0, len(rows), batch_size):
+        yield rows[start:start + batch_size]
+
+
+def prepare_catalog_rows(rows: List[Dict], columns: List[str], version: str) -> List[Dict]:
+    """Validate and restrict public catalog rows to columns accepted by the database."""
+    prepared = []
+    updated_at = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("id"):
+            raise ValueError(f"The {version} catalog contains a row without an ID")
+        clean = {column: row.get(column) for column in columns}
+        clean["version"] = version
+        clean["updated_at"] = row.get("updated_at") or updated_at
+        prepared.append(clean)
+    return prepared
+
+
+def load_catalog_region(catalog_root: Path, version: str):
+    directory = "data" if version == "international" else "data-asia"
+    region_root = catalog_root / directory
+    try:
+        sets = json.loads((region_root / "sets.json").read_text(encoding="utf-8"))
+        cards = json.loads((region_root / "cards.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not load the {version} catalog from {region_root}: {exc}") from exc
+    if not isinstance(sets, list) or not isinstance(cards, list) or not sets or not cards:
+        raise RuntimeError(f"The {version} catalog is incomplete")
+    return (
+        prepare_catalog_rows(sets, SET_COLUMNS, version),
+        prepare_catalog_rows(cards, CARD_COLUMNS, version),
+    )
+
+
+def load_catalog_prices(prices_root: Optional[Path], version: str) -> List[Dict]:
+    if prices_root is None:
+        return []
+    directory = "data" if version == "international" else "data-asia"
+    path = prices_root / directory / "prices.json"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not load catalog prices from {path}: {exc}") from exc
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Catalog prices must be a list: {path}")
+    updated_at = datetime.now(timezone.utc).isoformat()
+    return [
+        {
+            **{column: row.get(column) for column in PRICE_COLUMNS},
+            "updated_at": row.get("updated_at") or updated_at,
+        }
+        for row in rows
+        if isinstance(row, dict) and row.get("card_id")
+    ]
+
+
+def download_catalog(
+    base_url: str,
+    destination: Path,
+    expected_version: Optional[str] = None,
+    attempts: int = 60,
+    retry_delay: float = 10,
+) -> Path:
+    """Download and hash-check a complete catalog published on GitHub Pages."""
+    base_url = base_url.rstrip("/") + "/"
+    manifest = None
+    for attempt in range(1, attempts + 1):
+        response = requests.get(
+            urljoin(base_url, "manifest.json"),
+            params={"expected": expected_version} if expected_version else None,
+            timeout=30,
+        )
+        response.raise_for_status()
+        manifest = response.json()
+        if not expected_version or manifest.get("version") == expected_version:
+            break
+        if attempt == attempts:
+            raise RuntimeError(
+                f"GitHub Pages did not publish catalog {expected_version} after {attempts} checks"
+            )
+        print(f"Waiting for GitHub Pages catalog {expected_version[:12]} ({attempt}/{attempts})")
+        time.sleep(retry_delay)
+
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("regions"), dict):
+        raise RuntimeError("The catalog manifest is invalid")
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    version = str(manifest.get("version") or "")
+    for region in manifest["regions"].values():
+        for kind in ("sets", "cards", "prices"):
+            metadata = region.get(kind) if isinstance(region, dict) else None
+            relative = metadata.get("path") if isinstance(metadata, dict) else None
+            expected_hash = metadata.get("sha256") if isinstance(metadata, dict) else None
+            if not relative or not expected_hash:
+                raise RuntimeError(f"The catalog manifest is missing {kind} metadata")
+            relative_path = Path(relative)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise RuntimeError(f"Unsafe catalog path: {relative}")
+            file_response = requests.get(
+                urljoin(base_url, relative_path.as_posix()),
+                params={"version": version},
+                timeout=60,
+            )
+            file_response.raise_for_status()
+            content = file_response.content
+            actual_hash = hashlib.sha256(content).hexdigest()
+            if actual_hash != expected_hash:
+                raise RuntimeError(f"Hash mismatch downloading {relative}")
+            output_path = destination / relative_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(content)
+    print(f"Downloaded and verified catalog {version[:12]} from {base_url}")
+    return destination
+
+
+def seed_from_catalog(
+    catalog_root: Path,
+    version: str,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    prices_root: Optional[Path] = None,
+) -> None:
+    """Bulk-load a completed catalog. No upstream API requests are made here."""
+    sets, cards = load_catalog_region(catalog_root, version)
+    prices = load_catalog_prices(prices_root or catalog_root, version)
+    known_card_ids = {row["id"] for row in cards}
+    unknown_prices = {row["card_id"] for row in prices} - known_card_ids
+    if unknown_prices:
+        raise RuntimeError(f"Catalog prices reference unknown cards: {sorted(unknown_prices)[0]}")
+
+    print(f"Bulk loading {version}: {len(sets)} sets, {len(cards)} cards, {len(prices)} prices")
+    for rows in batched(sets, batch_size):
+        database.upsert_sets(rows)
+    for rows in tqdm(list(batched(cards, batch_size)), desc=f"Card batches ({version})", unit="batch"):
+        database.upsert_cards(rows)
+
+    prices_by_card = {}
+    for row in prices:
+        prices_by_card.setdefault(row["card_id"], []).append(row)
+    for card_rows in tqdm(list(batched(cards, batch_size)), desc=f"Price batches ({version})", unit="batch"):
+        card_ids = [row["id"] for row in card_rows]
+        batch_prices = [row for card_id in card_ids for row in prices_by_card.get(card_id, [])]
+        database.replace_prices_bulk(card_ids, batch_prices)
+
+    print(f"Completed bulk load for {version}")
+
+
 def upsert_set(set_data: Dict, version: str = "international") -> bool:
     """Insert or update a set."""
     try:
@@ -876,6 +1115,8 @@ def seed_all_data(limit_sets: Optional[int] = None, version: str = "internationa
                 cards = set_details.get('cards', [])
 
             tqdm.write(f"Found {len(cards)} cards in set {set_id}")
+            card_rows = []
+            prices_by_card = {}
             for j, card_summary in enumerate(tqdm(cards, desc=f"Cards in {set_id}", unit="card", leave=False), 1):
                 card_id = card_summary.get('id')
 
@@ -887,16 +1128,12 @@ def seed_all_data(limit_sets: Optional[int] = None, version: str = "internationa
                         cards_failed += 1
                         continue
 
-                    # Upsert card
-                    if upsert_card(card_details, version):
-                        cards_success += 1
-
-                        # Upsert pricing data if available
-                        if 'pricing' in card_details:
-                            price_count = upsert_prices(card_id, card_details['pricing'])
-                            prices_success += price_count
-                    else:
-                        cards_failed += 1
+                    source = detect_data_source(card_details)
+                    card_row = transform_card_data(card_details, version, source)
+                    card_rows.append(card_row)
+                    pricing = card_details.get('pricing')
+                    if isinstance(pricing, dict):
+                        prices_by_card[card_row['id']] = transform_price_data(card_row['id'], pricing)
 
                     # Rate limiting - be respectful to the API
                     if j % 10 == 0:
@@ -907,6 +1144,21 @@ def seed_all_data(limit_sets: Optional[int] = None, version: str = "internationa
                     print(f"✗ Error processing card {card_id}: {e}")
                     cards_failed += 1
                     continue
+
+            # Database writes are deliberately deferred until the set has been fetched.
+            # This turns hundreds of hosted-Postgres commits into one bounded transaction.
+            for rows in batched(card_rows, DEFAULT_BATCH_SIZE):
+                database.upsert_cards(rows)
+                cards_success += len(rows)
+                card_ids = [row['id'] for row in rows]
+                price_rows = [
+                    price
+                    for current_card_id in card_ids
+                    for price in prices_by_card.get(current_card_id, [])
+                ]
+                database.replace_prices_bulk(card_ids, price_rows)
+                prices_success += len(price_rows)
+            tqdm.write(f"Bulk upserted {len(card_rows)} cards for set {set_id}")
 
             # Pause between sets
             time.sleep(1)
@@ -1077,8 +1329,43 @@ if __name__ == "__main__":
         action="store_true",
         help="Create the Neon card tables from schema/neon_cards.sql, then exit."
     )
+    parser.add_argument(
+        "--catalog",
+        type=Path,
+        help="Bulk-load sets and cards from a completed Cardly catalog instead of fetching APIs.",
+    )
+    parser.add_argument(
+        "--catalog-url",
+        help="Download and verify the catalog from a GitHub Pages base URL before bulk loading.",
+    )
+    parser.add_argument(
+        "--expected-catalog-manifest",
+        type=Path,
+        help="Wait until --catalog-url publishes the version in this local manifest.",
+    )
+    parser.add_argument(
+        "--prices-catalog",
+        type=Path,
+        help="Optional alternate root for prices.json files (defaults to --catalog).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Rows per database request/transaction for catalog loads (default: {DEFAULT_BATCH_SIZE}).",
+    )
 
     args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    if args.catalog and args.catalog_url:
+        parser.error("Use either --catalog or --catalog-url, not both")
+    if args.expected_catalog_manifest and not args.catalog_url:
+        parser.error("--expected-catalog-manifest requires --catalog-url")
+    if args.prices_catalog and not (args.catalog or args.catalog_url):
+        parser.error("--prices-catalog requires --catalog or --catalog-url")
+    if (args.catalog or args.catalog_url) and (args.set_id or args.limit or args.prices_only):
+        parser.error("Catalog loading cannot be combined with --set, --limit, or --prices-only")
     try:
         database = build_database_target(args.db_target)
     except Exception as e:
@@ -1109,7 +1396,36 @@ if __name__ == "__main__":
         print("✓ Neon schema initialized from schema/neon_cards.sql")
         exit(0)
 
-    if args.prices_only:
+    if args.catalog or args.catalog_url:
+        temporary = tempfile.TemporaryDirectory() if args.catalog_url else None
+        try:
+            if args.catalog_url:
+                expected_version = None
+                if args.expected_catalog_manifest:
+                    expected_manifest = json.loads(
+                        args.expected_catalog_manifest.read_text(encoding="utf-8")
+                    )
+                    expected_version = expected_manifest.get("version")
+                catalog_root = download_catalog(
+                    args.catalog_url,
+                    Path(temporary.name),
+                    expected_version=expected_version,
+                )
+            else:
+                catalog_root = args.catalog.resolve()
+            versions = ("international", "japan") if args.version == "both" else (args.version,)
+            for version in versions:
+                seed_from_catalog(
+                    catalog_root,
+                    version,
+                    batch_size=args.batch_size,
+                    prices_root=args.prices_catalog.resolve() if args.prices_catalog else None,
+                )
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+
+    elif args.prices_only:
         if args.version == "both":
             seed_prices_only("international", show_prices=args.show_prices)
             time.sleep(2)

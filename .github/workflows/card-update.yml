@@ -1,8 +1,6 @@
 name: Card Database Update
 
 on:
-  schedule:
-    - cron: '0 0,12 * * *'
   workflow_dispatch:
 
 jobs:
@@ -14,7 +12,7 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
       DATABASE_URLS: ${{ secrets.DATABASE_URLS }}
-      POKEMON_API_KEY: ${{ secrets.POKEMON_API_KEY }}
+      CARD_CATALOG_URL: ${{ vars.CARD_CATALOG_URL || 'https://cardlyapp.github.io/cards-database' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,4 +36,9 @@ jobs:
           pip install -r requirements.txt --verbose
 
       - name: Run card updater
-        run: python pokemon-db-updater.py --db-target both --version both
+        run: >-
+          python pokemon-db-updater.py
+          --catalog-url "$CARD_CATALOG_URL"
+          --db-target both
+          --version both
+          --batch-size 100
